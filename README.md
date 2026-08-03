@@ -1,21 +1,26 @@
 # delve
 
-> A terminal roguelike about attention, consequence, and finding your way back up.
+> A terminal roguelike about going down, paying attention, and finding your way back out.
 
-![A seeded Delve run showing the third-person dungeon, map, and help overlay](assets/delve-gameplay.gif)
+![Delve gameplay: exploring a dungeon, fighting a slime, talking with an NPC, and checking the map](assets/delve-gameplay.gif)
 
-Delve is a keyboard-first third-person roguelike built in Rust. Descend through
-dangerous rooms, read the space around you, make a few permanent decisions, and
-carry what you learned back to the surface.
+Delve is a small third-person dungeon crawler for the terminal. You move one turn
+at a time, but there is always something to notice: a lit edge of a room, a door
+you have not opened, a monster winding up an attack, or a useful detail in the
+space just beyond the camera. Pay attention and the dungeon starts to make sense.
+Rush it and the dungeon remembers.
 
 There are two ways down:
 
 - **Classic** is a replayable five-floor procedural run. Find the Crown of Depth,
-  survive the return journey, and make it back to the surface.
+  survive the trip back up, and make it to the surface.
 - **Campaign — Chapter I** is a three-level authored route with named characters,
-  branching conversations, persistent trust, and objective gates. Its dedicated
-  completion screen records the bell choice instead of dropping you into an
-  unrelated procedural floor.
+  conversations, trust, and objectives that carry forward. It ends with the bell,
+  and the choice you make there.
+
+The GIF is a quick cut of real Delve captures: exploration, a slime fight, the
+opening campaign levels, a conversation with Tovan Reed, the map, and inventory.
+Some scenes are set up so the interesting parts arrive quickly.
 
 ## Play
 
@@ -26,7 +31,7 @@ rows tall.
 cargo run --release
 ```
 
-Useful starting points:
+A few useful ways to start:
 
 ```bash
 cargo run -- --seed 42       # reproducible dungeon
@@ -35,30 +40,30 @@ cargo run -- --replay delve_replay_42.json
 cargo run -- --help
 ```
 
-Classic is the default route. From the main menu, press `m` to open Campaign —
-Chapter I.
+Classic is the default. From the main menu, press `m` to open Campaign — Chapter I.
 
-The GIF above is a real seeded session from `--seed 42`, captured directly from
-the terminal UI.
+## What a run feels like
 
-## The shape of a run
+- You read the dungeon in pieces. The half-block view, lantern, materials, and
+  small edge markers tell you what is just outside the frame.
+- Fights are about timing. Enemies show their intent, stamina matters, and a guard
+  or interruption at the right moment can turn a bad room around. Terrain, traps,
+  pushes, and stagger are part of the fight too.
+- Gear does not stay pristine. Weapons wear down, cursed items bind until they
+  break, and three named artifacts have guaranteed places in the lower depths.
+- Some rooms are worth remembering: camps, shrines, flooded rooms, webs, forges,
+  ossuaries, and the cracked bell all have their own character.
+- Choices do not disappear when the turn ends. Conversations, trust, objectives,
+  challenges, the Crown, and your local run history give a run a longer memory.
 
-| System | What it asks of you |
-| --- | --- |
-| Perspective dungeon | Use the half-block diorama, lantern FOV, material cues, and edge chevrons to read what is just beyond the camera. |
-| Telegraph-driven combat | Spend stamina carefully, interrupt heavy windups, hold a guard for a counterstrike, and use traps, terrain, push, and stagger to change the odds. |
-| Equipment with memory | Weapons wear down, cursed gear binds until broken, and three named artifacts have guaranteed places in the lower depths. |
-| Places worth noticing | Camps, shrines, flooded rooms, webs, forges, ossuaries, and the cracked bell each have their own visual and mechanical signature. |
-| Consequences that travel | Conversations, trust, objectives, challenges, Crown pursuit, local run history, and deterministic replays keep decisions legible after the turn that made them. |
-
-The renderer is presentation-only around a deterministic turn simulation. Actors
-ease between cells, attacks telegraph and resolve on turns, and animation never
-changes collision, procedural generation, saves, or replay outcomes.
+Underneath, Delve is a deterministic turn simulation. The presentation eases
+actors between cells and telegraphs attacks, but it does not change collision,
+procedural generation, saves, or replay outcomes.
 
 ## Controls
 
-Delve is designed to be playable without leaving the keyboard. The in-game `?`
-screen is the source of truth and includes the complete control reference.
+You can play the whole game from the keyboard. Press `?` in-game for the complete
+reference; these are the keys you will use most:
 
 | Action | Keys |
 | --- | --- |
@@ -84,9 +89,9 @@ screen is the source of truth and includes the complete control reference.
 | Save / load / quit | `F5` · `F9` · `q` |
 
 From the main menu, `x` cycles optional challenges: no minimap, reduced sight,
-double weapon wear, and relentless mobile monsters. Presentation choices persist
-separately in `delve_settings.json`; completed wins and deaths are kept in a
-bounded local run history.
+double weapon wear, and relentless mobile monsters. Presentation choices live in
+`delve_settings.json`; completed wins and deaths are kept in a small local run
+history.
 
 ## What is in the dungeon
 
@@ -113,9 +118,9 @@ cargo test --all-targets
 cargo build --release
 ```
 
-Delve keeps its state local to the working directory. Replays are deterministic
-artifacts you can inspect or verify without opening the TUI, which makes seeded
-bugs and balancing changes easier to reproduce.
+Runs are deterministic, so a seed or replay file is enough to reproduce a bug,
+check a balance change, or share a strange moment from the dungeon without
+opening the TUI first.
 
 ## License
 
