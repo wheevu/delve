@@ -1,0 +1,10 @@
+/target
+delve_save.json
+delve_settings.json
+delve_runs.json
+delve_replay_*.json
+delve_save.json.tmp
+delve.log
+delve_crash.txt
+GAME.md
+CHANGELOG.md
