@@ -1,6 +1,16 @@
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 
+#[path = "world.rs"]
+pub mod world;
+
+use self::world::tile_terrain_rules;
+#[allow(unused_imports)] // Keep the world foundation available from `crate::map`.
+pub use self::world::{
+    place_seeded_decorations, DecorationAnchor, DecorationAnchorKind, EnvironmentProp, MapTheme,
+    MovementClass, PropKind, SurfaceKind, SurfaceMaterial, TerrainRules, WorldLink, WorldMapId,
+};
+
 /// A tile on the dungeon map.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Tile {
@@ -34,6 +44,26 @@ pub enum Tile {
     Urn,
     /// A breakable obstruction that blocks movement and sight.
     Barricade,
+}
+
+impl Tile {
+    /// Descriptive movement, visibility, and light facts for integrations.
+    /// `Map::is_walkable` and `Map::blocks_fov` remain authoritative.
+    pub const fn terrain_rules(self) -> TerrainRules {
+        tile_terrain_rules(self)
+    }
+
+    pub const fn movement_class(self) -> MovementClass {
+        self.terrain_rules().movement
+    }
+
+    pub const fn movement_cost(self) -> u8 {
+        self.terrain_rules().movement_cost()
+    }
+
+    pub const fn blocks_fov(self) -> bool {
+        self.terrain_rules().blocks_fov
+    }
 }
 
 /// A rectangular area on the map.
@@ -84,6 +114,15 @@ pub struct Map {
     /// Which tiles are currently visible (in FOV).
     pub visible: Vec<bool>,
     pub rooms: Vec<Rect>,
+    /// The visual style for maps without an explicit per-tile surface layer.
+    #[serde(default, skip_serializing_if = "MapTheme::is_default")]
+    pub theme: MapTheme,
+    /// Optional visual surface metadata. Tiles still own collision and FOV.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub surfaces: Option<Vec<SurfaceKind>>,
+    /// Authored or seeded decorative props, independent from `tiles`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub props: Vec<EnvironmentProp>,
 }
 
 impl Map {
@@ -96,7 +135,58 @@ impl Map {
             explored: vec![false; size],
             visible: vec![false; size],
             rooms: Vec::new(),
+            theme: MapTheme::default(),
+            surfaces: None,
+            props: Vec::new(),
         }
+    }
+
+    /// Construct a map with a visual theme while keeping default tile behavior.
+    pub fn with_theme(width: i32, height: i32, theme: MapTheme) -> Self {
+        let mut map = Self::new(width, height);
+        map.theme = theme;
+        map
+    }
+
+    /// Return the explicit surface at a coordinate, or the theme fallback.
+    pub fn surface_at(&self, x: i32, y: i32) -> Option<SurfaceKind> {
+        let index = self.checked_idx(x, y)?;
+        Some(
+            self.surfaces
+                .as_ref()
+                .and_then(|surfaces| surfaces.get(index).copied())
+                .unwrap_or_else(|| self.theme.default_surface()),
+        )
+    }
+
+    /// Set a visual surface without changing the authoritative tile layer.
+    pub fn set_surface(&mut self, x: i32, y: i32, surface: SurfaceKind) -> bool {
+        let Some(index) = self.checked_idx(x, y) else {
+            return false;
+        };
+        let expected_size = (self.width * self.height) as usize;
+        let fallback = self.theme.default_surface();
+        let surfaces = self
+            .surfaces
+            .get_or_insert_with(|| vec![fallback; expected_size]);
+        if surfaces.len() != expected_size {
+            surfaces.resize(expected_size, fallback);
+            surfaces.truncate(expected_size);
+        }
+        surfaces[index] = surface;
+        true
+    }
+
+    /// Return all props authored at a coordinate.
+    pub fn props_at(&self, x: i32, y: i32) -> impl Iterator<Item = &EnvironmentProp> {
+        self.props
+            .iter()
+            .filter(move |prop| prop.x == x && prop.y == y)
+    }
+
+    /// Replace decorative props with a deterministic seeded arrangement.
+    pub fn place_seeded_decorations(&mut self, seed: u64, anchors: &[DecorationAnchor]) {
+        self.props = place_seeded_decorations(seed, self.width, self.height, anchors);
     }
 
     /// Returns the flat index for (x, y). Assumes coordinates are in bounds.
@@ -186,6 +276,8 @@ impl Map {
         self.explored.fill(false);
         self.visible.fill(false);
         self.rooms.clear();
+        self.surfaces = None;
+        self.props.clear();
 
         let mut leaves: Vec<Rect> = Vec::new();
         let root = Rect {

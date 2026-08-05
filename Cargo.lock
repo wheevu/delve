@@ -298,6 +298,7 @@ dependencies = [
  "crossterm",
  "log",
  "rand",
+ "rand_chacha",
  "ratatui",
  "serde",
  "serde_json",

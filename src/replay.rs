@@ -6,12 +6,16 @@
 
 use crate::app::{ChallengeMode, GameMode, GameState, GameStatus, PreparationMenu, RunStats};
 use crate::campaign::CampaignState;
-use crate::entity::{Discipline, ItemKind, MonsterKind, NpcKind};
+use crate::entity::{Discipline, ItemKind, MonsterKind, NpcKind, ThreatIntent, WeaponMastery};
 use crate::input::Action;
-use crate::map::Tile;
+use crate::map::{EnvironmentProp, MapTheme, SurfaceKind, Tile};
 use crate::visual::VisualState;
 
 const MAX_REPLAY_ACTIONS: usize = 1_000_000;
+const MAX_REPLAY_MAP_PROPS: usize = 4_096;
+
+/// Replay schema containing the medieval world layout contract.
+pub(crate) const REPLAY_FORMAT_VERSION: u8 = 1;
 
 /// A single turn in the action log.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -80,6 +84,11 @@ impl From<Action> for ActionRepr {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ReplayData {
     pub seed: u64,
+    /// Distinct from `rules_version`: this rejects files whose serialized
+    /// world layout predates the current map contract without changing the
+    /// deterministic rules branch used for playback.
+    #[serde(default)]
+    pub format_version: u8,
     #[serde(default)]
     pub game_mode: GameMode,
     #[serde(default)]
@@ -106,6 +115,8 @@ pub struct ReplayOutcome {
     pub weapon: Option<ItemKind>,
     pub armor: Option<ItemKind>,
     #[serde(default)]
+    pub weapon_mastery: Option<WeaponMastery>,
+    #[serde(default)]
     pub stamina: u8,
     #[serde(default)]
     pub evasion_turns: u8,
@@ -127,6 +138,22 @@ pub struct ReplayOutcome {
     pub auto_pickup: bool,
     #[serde(default)]
     pub map_tiles: Vec<Tile>,
+    #[serde(default)]
+    pub map_width: i32,
+    #[serde(default)]
+    pub map_height: i32,
+    #[serde(default)]
+    pub map_explored: Vec<bool>,
+    #[serde(default)]
+    pub map_visible: Vec<bool>,
+    #[serde(default)]
+    pub map_rooms: Vec<(i32, i32, i32, i32)>,
+    #[serde(default)]
+    pub map_theme: MapTheme,
+    #[serde(default)]
+    pub map_surfaces: Option<Vec<SurfaceKind>>,
+    #[serde(default)]
+    pub map_props: Vec<EnvironmentProp>,
     #[serde(default)]
     pub monsters: Vec<ReplayMonster>,
     #[serde(default)]
@@ -157,6 +184,8 @@ pub struct ReplayMonster {
     windup: u8,
     staggered: u8,
     alert_turns: u8,
+    #[serde(default)]
+    intent: Option<ThreatIntent>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -178,6 +207,54 @@ pub struct ReplayNpc {
 }
 
 impl ReplayOutcome {
+    pub(crate) fn validate(&self) -> Result<(), String> {
+        const MAX_MAP_DIM: i32 = 256;
+        if self.map_width <= 0
+            || self.map_height <= 0
+            || self.map_width > MAX_MAP_DIM
+            || self.map_height > MAX_MAP_DIM
+        {
+            return Err("replay expected map has invalid dimensions".into());
+        }
+        let expected_size = (self.map_width * self.map_height) as usize;
+        if self.map_tiles.len() != expected_size {
+            return Err("replay expected map tile count mismatch".into());
+        }
+        if self.map_explored.len() != expected_size {
+            return Err("replay expected map explored length mismatch".into());
+        }
+        if self.map_visible.len() != expected_size {
+            return Err("replay expected map visible length mismatch".into());
+        }
+        if let Some(surfaces) = &self.map_surfaces {
+            if surfaces.len() != expected_size {
+                return Err("replay expected map surface length mismatch".into());
+            }
+        }
+        for (index, room) in self.map_rooms.iter().enumerate() {
+            if room.0 < 0
+                || room.1 < 0
+                || room.2 <= 0
+                || room.3 <= 0
+                || room.0 > self.map_width.saturating_sub(room.2)
+                || room.1 > self.map_height.saturating_sub(room.3)
+            {
+                return Err(format!("replay expected map room {index} out of bounds"));
+            }
+        }
+        if self.map_props.len() > MAX_REPLAY_MAP_PROPS {
+            return Err("replay expected map has too many environment props".into());
+        }
+        for (index, prop) in self.map_props.iter().enumerate() {
+            if prop.x < 0 || prop.x >= self.map_width || prop.y < 0 || prop.y >= self.map_height {
+                return Err(format!(
+                    "replay expected environment prop {index} out of bounds"
+                ));
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn from_state(state: &GameState) -> Self {
         Self {
             status: state.status,
@@ -192,6 +269,7 @@ impl ReplayOutcome {
             inventory: state.player.inventory.clone(),
             weapon: state.player.weapon,
             armor: state.player.armor,
+            weapon_mastery: state.player.weapon_mastery,
             stamina: state.player.stamina,
             evasion_turns: state.player.evasion_turns,
             counter_turns: state.player.counter_turns,
@@ -203,6 +281,19 @@ impl ReplayOutcome {
             rules_version: state.rules_version,
             auto_pickup: state.auto_pickup,
             map_tiles: state.map.tiles.clone(),
+            map_width: state.map.width,
+            map_height: state.map.height,
+            map_explored: state.map.explored.clone(),
+            map_visible: state.map.visible.clone(),
+            map_rooms: state
+                .map
+                .rooms
+                .iter()
+                .map(|room| (room.x, room.y, room.w, room.h))
+                .collect(),
+            map_theme: state.map.theme,
+            map_surfaces: state.map.surfaces.clone(),
+            map_props: state.map.props.clone(),
             monsters: state
                 .monsters
                 .iter()
@@ -219,6 +310,7 @@ impl ReplayOutcome {
                     windup: monster.windup,
                     staggered: monster.staggered,
                     alert_turns: monster.alert_turns,
+                    intent: monster.intent,
                 })
                 .collect(),
             items: state
@@ -271,6 +363,7 @@ impl ReplayData {
     ) -> Self {
         Self {
             seed,
+            format_version: REPLAY_FORMAT_VERSION,
             game_mode,
             challenge_mode,
             rules_version,
@@ -287,27 +380,55 @@ impl ReplayData {
         self.actions.push(ActionRecord { turn, action });
     }
 
+    pub(crate) fn validate(&self) -> Result<(), String> {
+        if self.format_version > REPLAY_FORMAT_VERSION {
+            return Err(format!(
+                "replay format version {} is newer than this build (max {})",
+                self.format_version, REPLAY_FORMAT_VERSION
+            ));
+        }
+        if self.format_version < REPLAY_FORMAT_VERSION {
+            return Err(format!(
+                "replay format version {} is from an older world format; start a new run (current {})",
+                self.format_version, REPLAY_FORMAT_VERSION
+            ));
+        }
+        if self.rules_version > crate::app::CURRENT_RULES_VERSION {
+            return Err(format!(
+                "replay rules version {} is newer than this build (max {})",
+                self.rules_version,
+                crate::app::CURRENT_RULES_VERSION
+            ));
+        }
+        if self.actions.len() > MAX_REPLAY_ACTIONS {
+            return Err(format!(
+                "replay has {} actions; maximum is {MAX_REPLAY_ACTIONS}",
+                self.actions.len()
+            ));
+        }
+        if let Some(expected) = &self.expected {
+            expected.validate()?;
+        }
+        Ok(())
+    }
+
     pub fn save_to_file(&self, path: &str) -> std::io::Result<()> {
+        self.validate().map_err(std::io::Error::other)?;
         let json = serde_json::to_string_pretty(self)?;
         std::fs::write(path, json)
     }
 }
 
 pub(crate) fn playback(data: &ReplayData) -> Result<GameState, String> {
-    if data.actions.len() > MAX_REPLAY_ACTIONS {
-        return Err(format!(
-            "replay has {} actions; maximum is {MAX_REPLAY_ACTIONS}",
-            data.actions.len()
-        ));
-    }
+    data.validate()?;
     let mut state = GameState::new(data.seed);
     state.game_mode = data.game_mode;
     state.challenge_mode = data.challenge_mode;
+    state.rules_version = data.rules_version;
     if data.game_mode == GameMode::Campaign {
         state.campaign = Some(CampaignState::new());
     }
-    state.new_game();
-    state.rules_version = data.rules_version;
+    state.new_game_with_rules(data.rules_version);
     state.replay_data = None;
     let mut visual = VisualState::new(state.map.width, state.map.height);
 
@@ -339,6 +460,16 @@ pub(crate) fn playback(data: &ReplayData) -> Result<GameState, String> {
             actual.finesse_rank = expected.finesse_rank;
             actual.resolve_rank = expected.resolve_rank;
             actual.pending_level_ups = expected.pending_level_ups;
+        }
+        if data.rules_version < 3 {
+            // Masteries and explicit threat intents are part of v3's
+            // presentation contract; legacy replays never recorded them.
+            actual.weapon_mastery = expected.weapon_mastery;
+            for (actual_monster, expected_monster) in
+                actual.monsters.iter_mut().zip(&expected.monsters)
+            {
+                actual_monster.intent = expected_monster.intent;
+            }
         }
         if &actual != expected {
             return Err(format!(
@@ -444,11 +575,103 @@ mod tests {
     }
 
     #[test]
+    fn playback_rejects_rules_from_a_newer_build() {
+        let replay = ReplayData::with_modes(
+            42,
+            GameMode::Classic,
+            ChallengeMode::Standard,
+            crate::app::CURRENT_RULES_VERSION + 1,
+        );
+
+        let error = match playback(&replay) {
+            Ok(_) => panic!("future rules should not be replayed"),
+            Err(error) => error,
+        };
+        assert!(error.contains("newer than this build"));
+    }
+
+    #[test]
+    fn playback_rejects_a_replay_from_an_older_world_format() {
+        let mut replay = ReplayData::with_modes(
+            42,
+            GameMode::Classic,
+            ChallengeMode::Standard,
+            crate::app::CURRENT_RULES_VERSION,
+        );
+        replay.format_version = REPLAY_FORMAT_VERSION - 1;
+
+        let error = match playback(&replay) {
+            Ok(_) => panic!("old world replays should not be played"),
+            Err(error) => error,
+        };
+        assert!(error.contains("older world format"));
+        assert!(error.contains("start a new run"));
+    }
+
+    #[test]
+    fn replay_format_version_round_trips_through_json() {
+        let replay = ReplayData::with_modes(
+            42,
+            GameMode::Classic,
+            ChallengeMode::Standard,
+            crate::app::CURRENT_RULES_VERSION,
+        );
+        let json = serde_json::to_string(&replay).expect("replay should serialize");
+        let decoded: ReplayData = serde_json::from_str(&json).expect("replay should deserialize");
+
+        assert_eq!(decoded.format_version, REPLAY_FORMAT_VERSION);
+    }
+
+    #[test]
+    fn replay_outcome_round_trips_world_map_metadata() {
+        let mut state = GameState::new(42);
+        state.new_game();
+        state.map.theme = MapTheme::Road;
+        state.map.set_surface(1, 1, SurfaceKind::Mud);
+        state
+            .map
+            .props
+            .push(EnvironmentProp::new(2, 2, crate::map::PropKind::Brazier));
+
+        let outcome = ReplayOutcome::from_state(&state);
+        let json = serde_json::to_string(&outcome).expect("outcome should serialize");
+        let decoded: ReplayOutcome =
+            serde_json::from_str(&json).expect("outcome should deserialize");
+
+        assert_eq!(decoded.map_theme, MapTheme::Road);
+        assert_eq!(decoded.map_surfaces, state.map.surfaces);
+        assert_eq!(decoded.map_props, state.map.props);
+        assert!(decoded.validate().is_ok());
+    }
+
+    #[test]
+    fn replay_rejects_a_malformed_world_map_snapshot() {
+        let mut state = GameState::new(42);
+        state.new_game();
+        let mut replay = ReplayData::with_modes(
+            42,
+            GameMode::Classic,
+            ChallengeMode::Standard,
+            crate::app::CURRENT_RULES_VERSION,
+        );
+        let mut outcome = ReplayOutcome::from_state(&state);
+        outcome.map_surfaces = Some(Vec::new());
+        replay.expected = Some(outcome);
+
+        let error = match playback(&replay) {
+            Ok(_) => panic!("invalid map snapshots must fail"),
+            Err(error) => error,
+        };
+        assert!(error.contains("surface length mismatch"));
+    }
+
+    #[test]
     fn legacy_replay_defaults_to_standard_classic_mode() {
         let replay: ReplayData = serde_json::from_str(r#"{"seed":42,"actions":[]}"#).unwrap();
 
         assert_eq!(replay.game_mode, GameMode::Classic);
         assert_eq!(replay.challenge_mode, ChallengeMode::Standard);
+        assert_eq!(replay.format_version, 0);
         assert_eq!(replay.rules_version, 0);
         assert!(replay.expected.is_none());
     }

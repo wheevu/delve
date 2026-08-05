@@ -3,6 +3,7 @@ mod app;
 mod campaign;
 mod combat;
 mod entity;
+mod floor;
 mod fov;
 mod image_render;
 mod input;
@@ -155,6 +156,14 @@ GAMEPLAY:
     find the Crown of Depth, and return to the surface to win.
     The deepest floor holds a Guardian — and no way further down.
     The main menu also opens Chapter I of the authored campaign.
+    Maps use a manuscript-fantasy palette with roads, dressed NPCs,
+    torchlight, and environmental landmarks to make each route readable.
+    Modern Classic runs remember visited floors: noise raises attention,
+    quiet turns cool it, and the Crown can wake a Stalker on the return route.
+    World-format changes start a fresh run; older saves are kept on disk but
+    will not be loaded into a newer world.
+    The current loadout technique is one of Kick, Shield Bash, Lunge, Sweep,
+    Earthbreak, or Cinder Arc; the forge can add a named mastery.
 
 CONTROLS:
     W / Up / k            move forward
@@ -164,7 +173,7 @@ CONTROLS:
     Z                     strafe left
     C                     strafe right
     Shift+Z / Shift+C     evasive step
-    Shift+T               use equipped technique
+    Shift+T               use loadout technique
     g                     pick up item
     Enter                 context action (pickup, talk, stairs)
     e                     toggle auto-pickup
@@ -177,10 +186,19 @@ CONTROLS:
     <                     ascend stairs
     x                     auto-explore
     m                     show/hide minimap
+    O                     open/close a facing door
+    v                     listen through a closed door
+    r                     disarm a revealed trap
     B                     discovered bestiary
     V                     expanded chronicle
-    v / O                 listen / toggle a facing door
+    f                     use the assigned quick item
     . / Space             wait one turn
+    F2                    reduced flash
+    F3                    high contrast
+    F4                    camera easing
+    F6                    head movement
+    F7                    viewport palette
+    F8                    low-motion presentation
     F5                    save game
     F9                    load game
     ?                     controls (also available from the main menu)

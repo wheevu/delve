@@ -94,6 +94,8 @@ pub fn monster_profile(kind: MonsterKind) -> (AiStrategy, SpecialAbility) {
         ),
         MonsterKind::Sentinel => (AiStrategy::Stationary, SpecialAbility::None),
         MonsterKind::Guardian => (AiStrategy::Chase, SpecialAbility::None),
+        MonsterKind::Stalker => (AiStrategy::Chase, SpecialAbility::None),
+        MonsterKind::BellWarden => (AiStrategy::Chase, SpecialAbility::None),
     }
 }
 
