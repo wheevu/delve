@@ -24,8 +24,8 @@ Some scenes are set up so the interesting parts arrive quickly.
 
 ## Play
 
-You need a recent Rust toolchain and a terminal at least 80 columns wide by 24
-rows tall.
+You need Rust 1.86 or newer and a terminal at least 80 columns wide by 24 rows
+tall.
 
 ```bash
 cargo run --release
@@ -121,6 +121,9 @@ cargo build --release
 Runs are deterministic, so a seed or replay file is enough to reproduce a bug,
 check a balance change, or share a strange moment from the dungeon without
 opening the TUI first.
+
+Press `?` in-game for the full rules reference.
+Run `delve --help` for the current command reference.
 
 ## License
 
