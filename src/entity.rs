@@ -23,6 +23,8 @@ pub enum MonsterKind {
     Necromancer,
     Sentinel,
     Guardian,
+    Stalker,
+    BellWarden,
 }
 
 impl MonsterKind {
@@ -100,6 +102,18 @@ impl MonsterKind {
                 attack: 10,
                 defense: 4,
             },
+            MonsterKind::Stalker => Stats {
+                hp: 26,
+                max_hp: 26,
+                attack: 7,
+                defense: 2,
+            },
+            MonsterKind::BellWarden => Stats {
+                hp: 34,
+                max_hp: 34,
+                attack: 9,
+                defense: 4,
+            },
         }
     }
 
@@ -117,6 +131,8 @@ impl MonsterKind {
             MonsterKind::Necromancer => 'N',
             MonsterKind::Sentinel => 'T',
             MonsterKind::Guardian => 'G',
+            MonsterKind::Stalker => 'H',
+            MonsterKind::BellWarden => 'B',
         }
     }
 
@@ -134,6 +150,8 @@ impl MonsterKind {
             MonsterKind::Necromancer => "necromancer",
             MonsterKind::Sentinel => "sentinel",
             MonsterKind::Guardian => "guardian",
+            MonsterKind::Stalker => "stalker",
+            MonsterKind::BellWarden => "bell warden",
         }
     }
 
@@ -151,6 +169,8 @@ impl MonsterKind {
             MonsterKind::Necromancer => 0.7,
             MonsterKind::Sentinel => 0.0, // stationary guardian
             MonsterKind::Guardian => 1.0, // always acts
+            MonsterKind::Stalker => 1.0,
+            MonsterKind::BellWarden => 0.8,
         }
     }
 
@@ -161,7 +181,7 @@ impl MonsterKind {
             MonsterKind::Orc | MonsterKind::Necromancer => 2,
             MonsterKind::Spider | MonsterKind::Sentinel => 3,
             MonsterKind::Wraith => 4,
-            MonsterKind::Guardian => 4,
+            MonsterKind::Guardian | MonsterKind::Stalker | MonsterKind::BellWarden => 4,
         }
     }
 
@@ -179,6 +199,7 @@ impl MonsterKind {
             MonsterKind::Necromancer => 2,
             MonsterKind::Sentinel => 1,
             MonsterKind::Guardian => 0, // never random, always placed
+            MonsterKind::Stalker | MonsterKind::BellWarden => 0, // anchor encounters
         }
     }
 
@@ -197,6 +218,8 @@ impl MonsterKind {
             MonsterKind::Necromancer => 45,
             MonsterKind::Sentinel => 40,
             MonsterKind::Guardian => 100,
+            MonsterKind::Stalker => 70,
+            MonsterKind::BellWarden => 120,
         }
     }
 
@@ -215,6 +238,8 @@ impl MonsterKind {
             MonsterKind::Necromancer => (10, 30),
             MonsterKind::Sentinel => (8, 20),
             MonsterKind::Guardian => (30, 60),
+            MonsterKind::Stalker => (15, 30),
+            MonsterKind::BellWarden => (25, 50),
         }
     }
 
@@ -255,6 +280,40 @@ impl MonsterKind {
     }
 }
 
+/// The next meaningful thing an enemy intends to do. It is deliberately
+/// compact: the player needs a readable promise, not a second combat UI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum IntentKind {
+    Strike,
+    Cast,
+    Guard,
+    Hunt,
+    Retreat,
+    Ring,
+}
+
+impl IntentKind {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Strike => "strike",
+            Self::Cast => "cast",
+            Self::Guard => "guard",
+            Self::Hunt => "hunt",
+            Self::Retreat => "retreat",
+            Self::Ring => "ring",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ThreatIntent {
+    pub kind: IntentKind,
+    pub target_x: i32,
+    pub target_y: i32,
+    pub power: u8,
+    pub turns: u8,
+}
+
 /// A monster on the map.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Monster {
@@ -285,6 +344,9 @@ pub struct Monster {
     pub last_seen_player_y: i32,
     #[serde(default)]
     pub alert_turns: u8,
+    /// Explicit v3 intent shown in the threat strip and persisted in saves.
+    #[serde(default)]
+    pub intent: Option<ThreatIntent>,
 }
 
 impl Monster {
@@ -305,6 +367,7 @@ impl Monster {
             last_seen_player_x: 0,
             last_seen_player_y: 0,
             alert_turns: 0,
+            intent: None,
         }
     }
 }
@@ -684,6 +747,60 @@ pub enum Discipline {
     Resolve,
 }
 
+/// A forge choice that changes how a weapon wants to be played. Masteries are
+/// intentionally few and named; they are run-defining techniques, not a
+/// procedural affix tree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum WeaponMastery {
+    KeenEdge,
+    Riposte,
+    HammerBreaker,
+    HammerQuake,
+    EmberKindle,
+    EmberWard,
+}
+
+impl WeaponMastery {
+    const BLADE_OPTIONS: &'static [Self] = &[Self::KeenEdge, Self::Riposte];
+    const HAMMER_OPTIONS: &'static [Self] = &[Self::HammerBreaker, Self::HammerQuake];
+    const EMBER_OPTIONS: &'static [Self] = &[Self::EmberKindle, Self::EmberWard];
+
+    pub fn options_for(weapon: Option<ItemKind>) -> &'static [Self] {
+        match weapon {
+            Some(ItemKind::RustySword | ItemKind::Longsword) => Self::BLADE_OPTIONS,
+            Some(ItemKind::Warhammer) => Self::HAMMER_OPTIONS,
+            Some(ItemKind::Emberbrand) => Self::EMBER_OPTIONS,
+            _ => &[],
+        }
+    }
+
+    pub fn compatible_with(self, weapon: Option<ItemKind>) -> bool {
+        Self::options_for(weapon).contains(&self)
+    }
+
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::KeenEdge => "Keen Edge",
+            Self::Riposte => "Riposte",
+            Self::HammerBreaker => "Breaker",
+            Self::HammerQuake => "Quake",
+            Self::EmberKindle => "Kindle",
+            Self::EmberWard => "Ember Ward",
+        }
+    }
+
+    pub const fn description(self) -> &'static str {
+        match self {
+            Self::KeenEdge => "+1 damage against healthy targets",
+            Self::Riposte => "+1 DEF while guarding; counters hit harder",
+            Self::HammerBreaker => "+1 stagger and a stronger shove",
+            Self::HammerQuake => "Earthbreak reaches one extra cell",
+            Self::EmberKindle => "Cinder Arc burns for +2 damage",
+            Self::EmberWard => "+1 DEF while Emberbrand is equipped",
+        }
+    }
+}
+
 impl Discipline {
     pub const fn name(self) -> &'static str {
         match self {
@@ -787,6 +904,9 @@ pub struct Player {
     pub weapon_durability: i32,
     #[serde(default)]
     pub weapon_cursed: bool,
+    /// The named forge discipline currently paired with the equipped weapon.
+    #[serde(default)]
+    pub weapon_mastery: Option<WeaponMastery>,
     #[serde(default)]
     pub armor_cursed: bool,
     #[serde(default = "default_stamina")]
@@ -850,6 +970,7 @@ impl Player {
             ward_turns: 0,
             weapon_durability: 0,
             weapon_cursed: false,
+            weapon_mastery: None,
             armor_cursed: false,
             stamina: MAX_STAMINA,
             max_stamina: MAX_STAMINA,
@@ -904,7 +1025,16 @@ impl Player {
 
     pub fn total_defense(&self) -> i32 {
         let bonus: i32 = self.armor.map(|a| a.defense_bonus()).unwrap_or(0);
-        self.stats.defense + bonus + i32::from(self.guarding) * 2 + i32::from(self.ward_turns > 0)
+        let mastery_bonus = match self.weapon_mastery {
+            Some(WeaponMastery::Riposte) if self.guarding => 1,
+            Some(WeaponMastery::EmberWard) if self.weapon == Some(ItemKind::Emberbrand) => 1,
+            _ => 0,
+        };
+        self.stats.defense
+            + bonus
+            + mastery_bonus
+            + i32::from(self.guarding) * 2
+            + i32::from(self.ward_turns > 0)
     }
 
     /// XP needed to reach the next level.

@@ -138,6 +138,36 @@ fn draw(
         palette_mode,
         visual::lerp(art.highlight, (255, 246, 218), pulse),
     );
+    let extrusion = (scale / 2).clamp(1, 2);
+    for (row, pixels) in art.frame.rows.iter().enumerate() {
+        for (column, pixel) in pixels.chars().enumerate() {
+            let rgb = match pixel {
+                '#' => Some(primary),
+                '+' | '*' => Some(secondary),
+                '.' => Some(visual::darken(primary, 0.34)),
+                _ => None,
+            };
+            let Some(rgb) = rgb else { continue };
+            for layer in (1..=extrusion).rev() {
+                let offset_x = layer;
+                let offset_y = (layer / 2).max(1);
+                let x = x + column as i32 * scale + offset_x;
+                let y = y + row as i32 * scale + offset_y;
+                for py in 0..scale {
+                    for px in 0..scale {
+                        let screen_x = x + px;
+                        if depth_visible(screen_x, depth_clip) {
+                            canvas.pixel(
+                                screen_x,
+                                y + py,
+                                color(visual::darken(rgb, 0.42 + layer as f32 * 0.08)),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
     for (row, pixels) in art.frame.rows.iter().enumerate() {
         for (column, pixel) in pixels.chars().enumerate() {
             let rgb = match pixel {
@@ -151,19 +181,22 @@ fn draw(
             for py in 0..scale {
                 for px in 0..scale {
                     let screen_x = x + column as i32 * scale + px;
-                    let visible = depth_clip.is_none_or(|(depth, wall_depth)| {
-                        screen_x >= 0
-                            && wall_depth
-                                .get(screen_x as usize)
-                                .is_some_and(|wall| depth < *wall)
-                    });
-                    if visible {
+                    if depth_visible(screen_x, depth_clip) {
                         canvas.pixel(screen_x, y + row as i32 * scale + py, color(rgb));
                     }
                 }
             }
         }
     }
+}
+
+fn depth_visible(screen_x: i32, depth_clip: Option<(f64, &[f64])>) -> bool {
+    depth_clip.is_none_or(|(depth, wall_depth)| {
+        screen_x >= 0
+            && wall_depth
+                .get(screen_x as usize)
+                .is_some_and(|wall| depth < *wall)
+    })
 }
 
 #[allow(clippy::too_many_arguments)]

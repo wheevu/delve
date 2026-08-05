@@ -64,6 +64,42 @@ pub fn spawn_guardian(
     monsters.push(Monster::new(gx, gy, MonsterKind::Guardian));
 }
 
+/// Place the v3 anchor that shares the Crown chamber with the Guardian. It
+/// lives in a different room so the final approach has a second problem to
+/// solve instead of becoming a single-stat boss door.
+pub fn spawn_bell_warden(
+    monsters: &mut Vec<Monster>,
+    map: &Map,
+    spawn_rooms: &[usize],
+    player_room_idx: Option<usize>,
+) {
+    let Some(&warden_room) = spawn_rooms
+        .iter()
+        .rev()
+        .find(|&&room| Some(room) != player_room_idx)
+    else {
+        return;
+    };
+    let room = &map.rooms[warden_room];
+    let (mut x, mut y) = room.center();
+    if monsters
+        .iter()
+        .any(|monster| monster.alive && (monster.x, monster.y) == (x, y))
+    {
+        x = (x + 1).min(room.x + room.w - 1);
+        y = (y + 1).min(room.y + room.h - 1);
+    }
+    if map.is_walkable(x, y)
+        && !monsters
+            .iter()
+            .any(|monster| monster.alive && (monster.x, monster.y) == (x, y))
+    {
+        let mut warden = Monster::new(x, y, MonsterKind::BellWarden);
+        warden.awakened = true;
+        monsters.push(warden);
+    }
+}
+
 // ── Item spawning ──
 
 /// Build an occupied‑cell bitmap for safe item placement.

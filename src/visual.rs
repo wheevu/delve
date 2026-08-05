@@ -38,6 +38,7 @@ pub enum PlayerActionKind {
     Turn(PlayerTurnKind),
     Attack { weapon: Option<ItemKind> },
     Technique(TechniqueKind),
+    UseItem(ItemKind),
     Guard,
     Hit,
     Heal,
@@ -61,6 +62,7 @@ impl PlayerAction {
         match kind {
             PlayerActionKind::Attack { .. } => 12,
             PlayerActionKind::Technique(_) => 14,
+            PlayerActionKind::UseItem(_) => 16,
             PlayerActionKind::Hit | PlayerActionKind::Heal => 10,
             PlayerActionKind::Dodge(_) => 10,
             PlayerActionKind::Guard | PlayerActionKind::Step(_) | PlayerActionKind::Turn(_) => 8,
@@ -122,6 +124,11 @@ impl PlayerAction {
                 (_, 1) => (2, 1),
                 _ => (0, 0),
             },
+            PlayerActionKind::UseItem(_) => match self.phase() {
+                0 => (0, -1),
+                1 => (1, 0),
+                _ => (0, 1),
+            },
             PlayerActionKind::Hit => match self.phase() {
                 0 => (1, -2),
                 1 => (-1, 1),
@@ -151,6 +158,59 @@ pub enum VisualEffect {
         y: i32,
         timer: u8,
         flash_color: (u8, u8, u8),
+    },
+    /// A weapon-specific swing or impact arc anchored to the struck cell.
+    WeaponSweep {
+        x: i32,
+        y: i32,
+        dx: i32,
+        dy: i32,
+        weapon: Option<ItemKind>,
+        counter: bool,
+        timer: u8,
+    },
+    /// The readable cast-up beat before a technique resolves.
+    TechniqueCast {
+        x: i32,
+        y: i32,
+        dx: i32,
+        dy: i32,
+        kind: TechniqueKind,
+        timer: u8,
+    },
+    /// The technique-specific shape at each affected target.
+    TechniqueImpact {
+        x: i32,
+        y: i32,
+        dx: i32,
+        dy: i32,
+        kind: TechniqueKind,
+        timer: u8,
+    },
+    /// A consumable, scroll, or lore item being used in the player's hands.
+    ItemCast {
+        x: i32,
+        y: i32,
+        kind: ItemKind,
+        timer: u8,
+    },
+    /// Dust, afterimage, or displaced cloak left by player movement.
+    MovementTrail {
+        x: i32,
+        y: i32,
+        dx: i32,
+        dy: i32,
+        dash: bool,
+        timer: u8,
+    },
+    /// A monster-specific casting tell, currently used by necromancer bolts.
+    MonsterCast {
+        x: i32,
+        y: i32,
+        kind: MonsterKind,
+        dx: i32,
+        dy: i32,
+        timer: u8,
     },
     /// A floating damage number that drifts upward.
     DamageNumber {
@@ -213,6 +273,12 @@ impl VisualEffect {
         match self {
             Self::ActorStep { timer, .. }
             | Self::AttackFlash { timer, .. }
+            | Self::WeaponSweep { timer, .. }
+            | Self::TechniqueCast { timer, .. }
+            | Self::TechniqueImpact { timer, .. }
+            | Self::ItemCast { timer, .. }
+            | Self::MovementTrail { timer, .. }
+            | Self::MonsterCast { timer, .. }
             | Self::DamageNumber { timer, .. }
             | Self::DeathBurst { timer, .. }
             | Self::ProjectileLaunch { timer, .. }
@@ -233,6 +299,12 @@ impl VisualEffect {
         }
         match self {
             Self::ActorStep { timer, .. } | Self::AttackFlash { timer, .. } => dec(timer),
+            Self::WeaponSweep { timer, .. }
+            | Self::TechniqueCast { timer, .. }
+            | Self::TechniqueImpact { timer, .. }
+            | Self::ItemCast { timer, .. }
+            | Self::MovementTrail { timer, .. }
+            | Self::MonsterCast { timer, .. } => dec(timer),
             Self::DamageNumber { timer, .. } => dec(timer),
             Self::DeathBurst { timer, .. } => dec(timer),
             Self::ProjectileLaunch { timer, .. } => dec(timer),
@@ -273,6 +345,78 @@ impl VisualEffect {
             y,
             timer: 6,
             flash_color: (255, 80, 80),
+        }
+    }
+
+    pub fn weapon_sweep(
+        x: i32,
+        y: i32,
+        dx: i32,
+        dy: i32,
+        weapon: Option<ItemKind>,
+        counter: bool,
+    ) -> Self {
+        Self::WeaponSweep {
+            x,
+            y,
+            dx,
+            dy,
+            weapon,
+            counter,
+            timer: 12,
+        }
+    }
+
+    pub fn technique_cast(x: i32, y: i32, dx: i32, dy: i32, kind: TechniqueKind) -> Self {
+        Self::TechniqueCast {
+            x,
+            y,
+            dx,
+            dy,
+            kind,
+            timer: 14,
+        }
+    }
+
+    pub fn technique_impact(x: i32, y: i32, dx: i32, dy: i32, kind: TechniqueKind) -> Self {
+        Self::TechniqueImpact {
+            x,
+            y,
+            dx,
+            dy,
+            kind,
+            timer: 10,
+        }
+    }
+
+    pub fn item_cast(x: i32, y: i32, kind: ItemKind) -> Self {
+        Self::ItemCast {
+            x,
+            y,
+            kind,
+            timer: 12,
+        }
+    }
+
+    pub fn movement_trail(x: i32, y: i32, dx: i32, dy: i32, dash: bool) -> Self {
+        Self::MovementTrail {
+            x,
+            y,
+            dx,
+            dy,
+            dash,
+            timer: if dash { 10 } else { 7 },
+        }
+    }
+
+    pub fn monster_cast(x: i32, y: i32, kind: MonsterKind, dx: i32, dy: i32) -> Self {
+        Self::MonsterCast {
+            x,
+            y,
+            kind,
+            dx,
+            dy,
+            timer: 10,
         }
     }
 
@@ -951,6 +1095,60 @@ mod tests {
             visual.tick();
         }
         assert!(visual.player_action.is_none());
+    }
+
+    #[test]
+    fn item_use_has_a_full_cast_sequence() {
+        let action = PlayerAction::new(PlayerActionKind::UseItem(ItemKind::ScrollOfFire));
+        assert_eq!(PlayerAction::duration(action.kind), 16);
+        assert_eq!(action.phase(), 0);
+        let mut action = action;
+        action.timer = 10;
+        assert_eq!(action.phase(), 1);
+        action.timer = 2;
+        assert_eq!(action.phase(), 2);
+    }
+
+    #[test]
+    fn authored_combat_effects_all_tick_and_expire() {
+        let mut visual = VisualState::new(80, 50);
+        visual.add_effect(VisualEffect::weapon_sweep(
+            4,
+            4,
+            1,
+            0,
+            Some(ItemKind::Longsword),
+            false,
+        ));
+        visual.add_effect(VisualEffect::technique_cast(
+            4,
+            4,
+            1,
+            0,
+            TechniqueKind::Lunge,
+        ));
+        visual.add_effect(VisualEffect::technique_impact(
+            5,
+            4,
+            1,
+            0,
+            TechniqueKind::Lunge,
+        ));
+        visual.add_effect(VisualEffect::item_cast(4, 4, ItemKind::ScrollOfBlink));
+        visual.add_effect(VisualEffect::movement_trail(3, 4, 1, 0, true));
+        visual.add_effect(VisualEffect::monster_cast(
+            8,
+            4,
+            MonsterKind::Necromancer,
+            -1,
+            0,
+        ));
+
+        assert_eq!(visual.effects.len(), 6);
+        for _ in 0..16 {
+            visual.tick();
+        }
+        assert!(visual.effects.is_empty());
     }
 
     #[test]

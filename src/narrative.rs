@@ -163,6 +163,12 @@ pub fn monster_first_sight(kind: MonsterKind) -> Option<&'static str> {
         }
         MonsterKind::Sentinel => Some("An armoured statue creaks to life — its eyes burning red."),
         MonsterKind::Guardian => Some("The Crown's protector rises — ancient, colossal, silent."),
+        MonsterKind::Stalker => {
+            Some("A shape steps out of the room you just left. It has been following.")
+        }
+        MonsterKind::BellWarden => {
+            Some("The bell warden lifts its iron head. The chamber remembers your name.")
+        }
     }
 }
 
@@ -255,6 +261,14 @@ pub fn kill_flavour(kind: MonsterKind, rng: &mut impl Rng) -> &'static str {
             "With a sound like mountains cracking, the Guardian falls.",
             "You stand over the Guardian's broken form. The way is open.",
         ],
+        MonsterKind::Stalker => &[
+            "The stalker unthreads into the dark it came from.",
+            "The thing following your trail finally loses it.",
+        ],
+        MonsterKind::BellWarden => &[
+            "The bell warden falls silent. The stone keeps ringing.",
+            "Iron buckles and the warden's last note dies in the chamber.",
+        ],
     };
     lines[rng.gen_range(0..lines.len())]
 }
@@ -298,6 +312,14 @@ pub fn hit_flavour(kind: MonsterKind, _damage: i32, critical: bool, rng: &mut im
             "Your weapon glances off ancient armour.",
             "The Guardian barely flinches.",
         ],
+        MonsterKind::Stalker => &[
+            "You catch the stalker before it can slip away.",
+            "The thing's outline tears around your strike.",
+        ],
+        MonsterKind::BellWarden => &[
+            "Your blow rings through the warden's iron shell.",
+            "The warden absorbs the hit with a dull bronze note.",
+        ],
     };
     lines[rng.gen_range(0..lines.len())].to_string()
 }
@@ -340,6 +362,14 @@ pub fn monster_hit_flavour(kind: MonsterKind, _damage: i32, rng: &mut impl Rng) 
         MonsterKind::Guardian => &[
             "The Guardian's blow shakes the chamber!",
             "Ancient fury smashes into you!",
+        ],
+        MonsterKind::Stalker => &[
+            "The stalker strikes from the edge of your sight!",
+            "A hooked shadow catches you in the ribs!",
+        ],
+        MonsterKind::BellWarden => &[
+            "The warden's hammer lands like a struck bell!",
+            "A bronze shock rolls through your bones!",
         ],
     };
     lines[rng.gen_range(0..lines.len())].to_string()

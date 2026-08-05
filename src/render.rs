@@ -4,10 +4,14 @@ use crate::app::{
 };
 use crate::campaign::{self, CampaignFlag, CampaignObjective};
 use crate::entity::{
-    Camp, Item, ItemKind, Landmark, Monster, MonsterKind, Npc, Player, Projectile, TechniqueKind,
+    Camp, Item, ItemKind, Landmark, Monster, MonsterKind, Npc, NpcKind, Player, Projectile,
+    TechniqueKind,
 };
+use crate::floor::FloorMemory;
 use crate::image_render::HalfBlockCanvas;
-use crate::map::{Map, Tile};
+use crate::map::{
+    Map, MapTheme, PropKind, SurfaceKind, SurfaceMaterial, Tile, WorldLink, WorldMapId,
+};
 use crate::ui::{MessageLog, MsgColor};
 use crate::visual::{
     self, Biome, PlayerActionKind, PlayerStepKind, PlayerTurnKind, VisualEffect, VisualState,
@@ -47,6 +51,9 @@ const ITEM_ARMOR_COLOR: Color = Color::Rgb(100, 180, 255);
 const ITEM_CROWN_COLOR: Color = Color::Rgb(255, 215, 0);
 
 const PANEL_BG: Color = Color::Rgb(18, 18, 26);
+const DIALOG_BG: Color = Color::Rgb(28, 22, 18);
+const DIALOG_BORDER: Color = Color::Rgb(166, 132, 82);
+const PORTRAIT_BG: Color = Color::Rgb(38, 28, 20);
 const TEXT_DIM: Color = Color::Rgb(110, 110, 120);
 const TEXT_BRIGHT: Color = Color::Rgb(220, 220, 230);
 const HP_BAR_FULL: Color = Color::Rgb(0, 255, 136);
@@ -58,6 +65,8 @@ const FOV_RADIUS: i32 = 8;
 /// All data needed for one frame of rendering.
 pub struct RenderCtx<'a> {
     pub map: &'a Map,
+    pub world_map_id: WorldMapId,
+    pub world_links: &'a [WorldLink],
     pub player: &'a Player,
     pub monsters: &'a [Monster],
     pub items: &'a [Item],
@@ -72,6 +81,8 @@ pub struct RenderCtx<'a> {
     pub stats: &'a RunStats,
     pub seed: u64,
     pub challenge_mode: ChallengeMode,
+    pub floor_memory: &'a FloorMemory,
+    pub cached_floor_count: usize,
     pub completed_runs: usize,
     pub run_history: &'a [crate::run_history::RunSummary],
     pub inventory_cursor: usize,
@@ -82,6 +93,8 @@ pub struct RenderCtx<'a> {
     pub tick: u64,
     /// Active dialog: NPC name.
     pub dialog_npc_name: &'a str,
+    /// Active dialog: exact NPC index, when the speaker is an NPC on this floor.
+    pub dialog_npc_idx: Option<usize>,
     /// Active dialog: text lines.
     pub dialog_text: &'a [String],
     /// Whether the dialog is currently showing player choices.
@@ -483,6 +496,98 @@ fn tile_style(
     }
 }
 
+fn surface_style(
+    surface: Option<SurfaceKind>,
+    visible: bool,
+    biome: Biome,
+    dist: f64,
+    radius: i32,
+) -> (char, Color, Color) {
+    let surface = surface.unwrap_or(SurfaceKind::Floor(SurfaceMaterial::Stone));
+    let (mut glyph, color) = match surface {
+        SurfaceKind::Floor(material)
+        | SurfaceKind::Ground(material)
+        | SurfaceKind::Road(material)
+        | SurfaceKind::Bridge(material) => match material {
+            SurfaceMaterial::Stone => (' ', biome.floor_visible()),
+            SurfaceMaterial::Cobblestone => ('·', (168, 140, 104)),
+            SurfaceMaterial::Dirt => (';', (132, 92, 56)),
+            SurfaceMaterial::Grass => (',', (102, 136, 76)),
+            SurfaceMaterial::Timber => ('=', (148, 102, 62)),
+            SurfaceMaterial::Moss => (',', (108, 136, 84)),
+        },
+        SurfaceKind::Mud => (';', (112, 76, 50)),
+        SurfaceKind::ShallowWater => ('~', (78, 158, 184)),
+    };
+    if surface.is_road() && surface.material() == Some(SurfaceMaterial::Stone) {
+        glyph = '·';
+    }
+    let color = if visible {
+        depth_color(
+            Color::Rgb(color.0, color.1, color.2),
+            biome,
+            dist,
+            radius,
+            0.38,
+        )
+    } else {
+        Color::Rgb(color.0 / 2, color.1 / 2, color.2 / 2)
+    };
+    let background = if visible {
+        let floor = biome.floor_visible();
+        depth_color(
+            Color::Rgb(floor.0, floor.1, floor.2),
+            biome,
+            dist,
+            radius,
+            0.22,
+        )
+    } else {
+        Color::Rgb(10, 10, 12)
+    };
+    (glyph, color, background)
+}
+
+fn prop_glyph(kind: PropKind, tick: u64) -> char {
+    match kind {
+        PropKind::RoadMarker => '│',
+        PropKind::Signpost => '⚑',
+        PropKind::Brazier => {
+            if tick % 8 < 4 {
+                '♨'
+            } else {
+                '✦'
+            }
+        }
+        PropKind::Torch => {
+            if tick % 8 < 4 {
+                '†'
+            } else {
+                '‡'
+            }
+        }
+        PropKind::Gate => '╬',
+        PropKind::Rubble => '∴',
+        PropKind::Tree => '♣',
+        PropKind::Cart => '▣',
+        PropKind::Barrel => '◉',
+        PropKind::Crate => '▤',
+        PropKind::Banner => '⚑',
+        PropKind::Shrine => '♰',
+    }
+}
+
+fn prop_color(kind: PropKind) -> Color {
+    match kind {
+        PropKind::Brazier | PropKind::Torch => Color::Rgb(248, 166, 66),
+        PropKind::Tree => Color::Rgb(92, 142, 76),
+        PropKind::Banner | PropKind::Signpost => Color::Rgb(196, 132, 72),
+        PropKind::Gate | PropKind::Rubble => Color::Rgb(164, 134, 96),
+        PropKind::Cart | PropKind::Barrel | PropKind::Crate => Color::Rgb(172, 118, 66),
+        PropKind::RoadMarker | PropKind::Shrine => Color::Rgb(210, 178, 110),
+    }
+}
+
 #[derive(Clone, Copy)]
 struct TerrainSample {
     tile: Tile,
@@ -641,7 +746,7 @@ pub(crate) fn render_minimap(buf: &mut Buffer, area: Rect, ctx: &RenderCtx) {
             }
 
             let dist = (((mx - ctx.player.x).pow(2) + (my - ctx.player.y).pow(2)) as f64).sqrt();
-            let (mut ch, fg, bg) = tile_style(
+            let (mut ch, mut fg, mut bg) = tile_style(
                 tile,
                 visible,
                 biome,
@@ -653,6 +758,20 @@ pub(crate) fn render_minimap(buf: &mut Buffer, area: Rect, ctx: &RenderCtx) {
                 my,
                 ctx.tick,
             );
+            let (surface_ch, surface_fg, surface_bg) =
+                surface_style(map.surface_at(mx, my), visible, biome, dist, light_radius);
+            if matches!(
+                tile,
+                Tile::Floor | Tile::DoorOpen | Tile::TrapHidden | Tile::History(_)
+            ) {
+                ch = surface_ch;
+                fg = surface_fg;
+                // Keep the map's fog treatment while allowing road and ground
+                // materials to read as distinct routes at a glance.
+                if visible {
+                    bg = surface_bg;
+                }
+            }
             if tile == Tile::Wall {
                 ch = visual::wall_glyph(map, mx, my);
             }
@@ -680,6 +799,11 @@ pub(crate) fn render_minimap(buf: &mut Buffer, area: Rect, ctx: &RenderCtx) {
                     entity = Some((
                         npc.kind.symbol(),
                         depth_color(NPC_COLOR, biome, dist, light_radius, 0.42),
+                    ));
+                } else if let Some(prop) = map.props_at(mx, my).next() {
+                    entity = Some((
+                        prop_glyph(prop.kind, ctx.tick),
+                        depth_color(prop_color(prop.kind), biome, dist, light_radius, 0.35),
                     ));
                 } else if ctx.projectiles.iter().any(|p| p.x == mx && p.y == my) {
                     entity = Some(('*', NECROMANCER_COLOR));
@@ -801,6 +925,8 @@ fn monster_render_glyph(kind: MonsterKind, tick: visual::Tick) -> char {
         MonsterKind::Necromancer => '♜',
         MonsterKind::Sentinel => '◆',
         MonsterKind::Guardian => 'Ω',
+        MonsterKind::Stalker => '◈',
+        MonsterKind::BellWarden => '⦿',
         _ => kind.symbol(),
     }
 }
@@ -819,6 +945,8 @@ fn monster_color(kind: MonsterKind) -> Color {
         MonsterKind::Necromancer => NECROMANCER_COLOR,
         MonsterKind::Sentinel => SENTINEL_COLOR,
         MonsterKind::Guardian => GUARDIAN_COLOR,
+        MonsterKind::Stalker => Color::Rgb(166, 90, 202),
+        MonsterKind::BellWarden => Color::Rgb(224, 164, 68),
     }
 }
 
@@ -891,13 +1019,19 @@ fn render_sidebar(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
         .collect::<Vec<_>>()
         .join("");
 
-    let depth_name = match depth {
-        0 => "Surface Cavern",
-        1 => "Frozen Depths",
-        2 => "Rust Crypts",
-        3 => "Spider Lairs",
-        4 => "Void Chamber",
-        _ => "???",
+    let depth_name = match ctx.map.theme {
+        MapTheme::Village => "Warden's Village",
+        MapTheme::Road => "Old King's Road",
+        MapTheme::Ruins => "Bell-Line Ruins",
+        MapTheme::Shrine => "Pilgrim Shrine",
+        MapTheme::Dungeon => match depth {
+            0 => "Surface Cavern",
+            1 => "Frozen Depths",
+            2 => "Rust Crypts",
+            3 => "Spider Lairs",
+            4 => "Void Chamber",
+            _ => "???",
+        },
     };
 
     let mut lines = vec![
@@ -908,6 +1042,35 @@ fn render_sidebar(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
         Line::from(""),
         // HP bar using Gauge
     ];
+
+    if !ctx.floor_memory.room_alert.is_empty() {
+        let attention = usize::from(ctx.floor_memory.attention);
+        let filled = (attention / 10).min(10);
+        lines.push(Line::from(vec![
+            Span::styled("Memory ", Style::default().fg(TEXT_DIM)),
+            Span::styled(
+                format!(
+                    "{}{} {}%",
+                    "▰".repeat(filled),
+                    "·".repeat(10 - filled),
+                    attention
+                ),
+                Style::default().fg(if attention >= 60 {
+                    Color::Rgb(236, 104, 80)
+                } else if attention >= 25 {
+                    Color::Rgb(216, 174, 84)
+                } else {
+                    Color::Rgb(112, 182, 164)
+                }),
+            ),
+        ]));
+        if ctx.cached_floor_count > 0 {
+            lines.push(Line::from(Span::styled(
+                format!("Remembered floors: {}", ctx.cached_floor_count),
+                Style::default().fg(TEXT_DIM),
+            )));
+        }
+    }
 
     let heading = facing_name(ctx.camera_angle);
     let mut facing = vec![Span::styled("Facing ", Style::default().fg(TEXT_DIM))];
@@ -1055,6 +1218,18 @@ fn render_sidebar(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
     lines.push(Line::from(""));
 
     if !compact {
+        lines.push(Line::from(vec![
+            Span::styled("Route ", Style::default().fg(TEXT_DIM)),
+            Span::styled(
+                format!(
+                    "{} · {} links",
+                    world_location_name(ctx.world_map_id),
+                    ctx.world_links.len()
+                ),
+                Style::default().fg(Color::Rgb(178, 148, 96)),
+            ),
+        ]));
+        lines.push(Line::from(""));
         // Gear section
         lines.push(Line::from(Span::styled(
             "══ Gear ══",
@@ -1116,6 +1291,15 @@ fn render_sidebar(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
                 Style::default().fg(TEXT_DIM),
             ),
         ]));
+        if let Some(mastery) = player
+            .weapon_mastery
+            .filter(|mastery| mastery.compatible_with(player.weapon))
+        {
+            lines.push(Line::from(vec![
+                Span::styled("M ", Style::default().fg(Color::Rgb(196, 134, 255))),
+                Span::styled(mastery.name(), Style::default().fg(TEXT_BRIGHT)),
+            ]));
+        }
         lines.push(Line::from(Span::styled(
             format!(
                 "V{} F{} R{}",
@@ -1296,6 +1480,22 @@ fn render_sidebar(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
     frame.render_widget(p, inner);
 }
 
+fn world_location_name(id: WorldMapId) -> &'static str {
+    match id {
+        WorldMapId::Village => "Warden's Village",
+        WorldMapId::OldKingsRoad => "Old King's Road",
+        WorldMapId::BellLineGate => "Bell-Line Gate",
+        WorldMapId::Dungeon { depth: 0 } => "Surface Cavern",
+        WorldMapId::Dungeon { depth } => match depth {
+            1 => "Frozen Depths",
+            2 => "Rust Crypts",
+            3 => "Spider Lairs",
+            4 => "Void Chamber",
+            _ => "Unknown Depth",
+        },
+    }
+}
+
 fn player_posture(ctx: &RenderCtx<'_>) -> (String, Color) {
     let critical = ctx.player.stats.hp * 10 <= ctx.player.stats.max_hp.max(1) * 3;
     let Some(action) = ctx.visual.player_action else {
@@ -1335,6 +1535,7 @@ fn player_posture(ctx: &RenderCtx<'_>) -> (String, Color) {
         PlayerActionKind::Turn(PlayerTurnKind::Right) => ("turn right", TEXT_DIM),
         PlayerActionKind::Attack { .. } => ("ATTACK", Color::Rgb(255, 174, 72)),
         PlayerActionKind::Technique(kind) => (kind.name(), Color::Rgb(255, 202, 92)),
+        PlayerActionKind::UseItem(kind) => (kind.name(), Color::Rgb(132, 226, 202)),
         PlayerActionKind::Guard => ("GUARD", Color::Rgb(120, 190, 255)),
         PlayerActionKind::Hit => ("HIT", HP_BAR_LOW),
         PlayerActionKind::Heal => ("mend", Color::Rgb(104, 246, 166)),
@@ -1885,6 +2086,16 @@ fn render_context_strip(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
         }
     } else if let Some(direction) = adjacent_threat_direction(ctx) {
         (format!("Threat {}", direction), Color::Rgb(255, 92, 72))
+    } else if ctx.floor_memory.attention >= 85 {
+        (
+            "The whole floor is listening · keep moving or find quiet".to_string(),
+            Color::Rgb(232, 104, 80),
+        )
+    } else if ctx.floor_memory.attention >= 60 {
+        (
+            "Your trail is hot · rooms ahead are beginning to hunt".to_string(),
+            Color::Rgb(224, 168, 84),
+        )
     } else if let Some(sound) = distant_sound(ctx) {
         (sound, Color::Rgb(116, 178, 194))
     } else if player.crown_held {
@@ -2000,7 +2211,11 @@ fn distant_sound(ctx: &RenderCtx<'_>) -> Option<String> {
                 MonsterKind::Skeleton => "bones scraping",
                 MonsterKind::Bat => "wings",
                 MonsterKind::Wraith => "a cold whisper",
-                MonsterKind::Orc | MonsterKind::Guardian | MonsterKind::Sentinel => "heavy steps",
+                MonsterKind::Orc
+                | MonsterKind::Guardian
+                | MonsterKind::Sentinel
+                | MonsterKind::Stalker => "heavy steps",
+                MonsterKind::BellWarden => "a low bell note",
                 _ => "movement",
             };
             format!("You hear {sound} {direction}")
@@ -2035,7 +2250,17 @@ fn monster_condition(monster: &Monster) -> &'static str {
 fn monster_intent(monster: &Monster, player: &Player) -> &'static str {
     let health = monster.stats.hp as f32 / monster.stats.max_hp.max(1) as f32;
     let distance = (monster.x - player.x).abs() + (monster.y - player.y).abs();
-    if monster.windup > 0 {
+    if let Some(intent) = monster.intent {
+        match intent.kind {
+            crate::entity::IntentKind::Strike if monster.windup > 0 => "HEAVY ATTACK INCOMING",
+            crate::entity::IntentKind::Ring => "RESONANT BLOW INCOMING",
+            crate::entity::IntentKind::Cast => "CASTING",
+            crate::entity::IntentKind::Guard => "guarding",
+            crate::entity::IntentKind::Hunt => "hunting",
+            crate::entity::IntentKind::Retreat => "retreating",
+            crate::entity::IntentKind::Strike => intent.kind.label(),
+        }
+    } else if monster.windup > 0 {
         "HEAVY ATTACK INCOMING"
     } else if monster.kind == MonsterKind::Guardian && monster.stats.hp * 2 <= monster.stats.max_hp
     {
@@ -2215,7 +2440,7 @@ fn render_bestiary_overlay(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
     let inner = block.inner(popup);
     frame.render_widget(block, popup);
 
-    const KINDS: [MonsterKind; 12] = [
+    const KINDS: [MonsterKind; 14] = [
         MonsterKind::Rat,
         MonsterKind::Bat,
         MonsterKind::Goblin,
@@ -2228,6 +2453,8 @@ fn render_bestiary_overlay(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
         MonsterKind::Necromancer,
         MonsterKind::Sentinel,
         MonsterKind::Guardian,
+        MonsterKind::Stalker,
+        MonsterKind::BellWarden,
     ];
     let mut lines = vec![
         Line::from(Span::styled(
@@ -2307,6 +2534,25 @@ fn render_preparation_overlay(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
                 "3  Blessing      +1 ATK/DEF for 60 turns · 15 gold".to_string(),
             ],
         ),
+        PreparationMenu::Mastery(weapon) => {
+            let options = crate::entity::WeaponMastery::options_for(Some(weapon));
+            (
+                format!(" {} · choose a weapon path ", weapon.name()),
+                "The forge cannot teach both lessons in one run.".to_string(),
+                options
+                    .iter()
+                    .enumerate()
+                    .map(|(index, mastery)| {
+                        format!(
+                            "{}  {:<12} {}",
+                            index + 1,
+                            mastery.name(),
+                            mastery.description()
+                        )
+                    })
+                    .collect(),
+            )
+        }
     };
     let block = Block::default()
         .borders(Borders::ALL)
@@ -2380,6 +2626,8 @@ fn monster_behavior_hint(kind: MonsterKind) -> &'static str {
         MonsterKind::Necromancer => "Keeps distance and casts bolts.",
         MonsterKind::Sentinel => "Guards its ground.",
         MonsterKind::Guardian => "The deepest chamber's keeper.",
+        MonsterKind::Stalker => "Follows disturbed floors and punishes retreat.",
+        MonsterKind::BellWarden => "Telegraphs a resonant blow that must be broken.",
     }
 }
 
@@ -2959,29 +3207,152 @@ fn render_end_screen(frame: &mut Frame, ctx: &RenderCtx, title: &str, title_colo
 // ══════════════════════════════════════════════════════════════════════════════
 
 fn render_dialog_overlay(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
-    let popup_w = 54u16;
-    let text_lines = ctx.dialog_text.len() as u16;
-    let choice_lines = if ctx.dialog_show_choices {
-        ctx.dialog_choices.len() as u16 + 1
+    let popup_w = area.width.saturating_sub(4).clamp(1, 76);
+    let portrait_w = if popup_w >= 48 { 15 } else { 0 };
+    let text_width = popup_w.saturating_sub(portrait_w + 6).max(12);
+    let text_lines = ctx
+        .dialog_text
+        .iter()
+        .map(|line| wrapped_dialog_line_count(line, text_width))
+        .sum::<u16>();
+    let choice_lines = if ctx.dialog_show_choices && !ctx.dialog_choices.is_empty() {
+        let choices = ctx
+            .dialog_choices
+            .iter()
+            .enumerate()
+            .map(|(index, choice)| {
+                wrapped_dialog_line_count(&format!("  {}. {}", index + 1, choice), text_width)
+            })
+            .sum::<u16>();
+        choices + 4
     } else {
-        0
+        2
     };
-    let popup_h = (text_lines + choice_lines + 6).min(area.height.saturating_sub(4));
+    let content_lines = text_lines + choice_lines + 2;
+    let popup_h = (content_lines + 2)
+        .max(13)
+        .min(area.height.saturating_sub(2).max(1));
 
     let popup = centered_rect(area, popup_w, popup_h);
     frame.render_widget(Clear, popup);
 
     let block = Block::default()
+        .title(Span::styled(
+            " conversation ",
+            Style::default()
+                .fg(Color::Rgb(230, 192, 122))
+                .add_modifier(Modifier::BOLD),
+        ))
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Rgb(140, 160, 180)))
-        .style(Style::default().bg(PANEL_BG));
+        .border_style(Style::default().fg(DIALOG_BORDER))
+        .style(Style::default().bg(DIALOG_BG));
     let inner = block.inner(popup);
     frame.render_widget(block, popup);
 
+    if portrait_w > 0 && inner.width > portrait_w + 8 {
+        let columns = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Length(portrait_w), Constraint::Fill(1)])
+            .split(inner);
+        render_dialog_portrait(frame, columns[0], ctx);
+        render_dialog_text(frame, columns[1], ctx);
+    } else {
+        render_dialog_text(frame, inner, ctx);
+    }
+}
+
+const BELL_PORTRAIT: &[&str] = &[
+    "    *    ",
+    "   ***   ",
+    "  #####  ",
+    "  #***#  ",
+    " ####### ",
+    "   ###   ",
+    "   # #   ",
+    "  ## ##  ",
+    "    .    ",
+];
+
+fn dialog_portrait_kind(npcs: &[Npc], dialog_npc_idx: Option<usize>) -> Option<NpcKind> {
+    dialog_npc_idx
+        .and_then(|index| npcs.get(index))
+        .map(|npc| npc.kind)
+}
+
+fn render_dialog_portrait(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
+    let portrait_block = Block::default()
+        .borders(Borders::RIGHT)
+        .border_style(Style::default().fg(Color::Rgb(112, 88, 58)))
+        .style(Style::default().bg(PORTRAIT_BG))
+        .title(Span::styled(" likeness ", Style::default().fg(TEXT_DIM)));
+    let inner = portrait_block.inner(area);
+    frame.render_widget(portrait_block, area);
+
+    let lines = dialog_portrait_lines(ctx);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .centered()
+            .style(Style::default().bg(PORTRAIT_BG)),
+        inner,
+    );
+}
+
+fn dialog_portrait_lines(ctx: &RenderCtx) -> Vec<Line<'static>> {
+    let (rows, primary, accent, skin) =
+        if let Some(kind) = dialog_portrait_kind(ctx.npcs, ctx.dialog_npc_idx) {
+            let art = crate::third_person::npc_art(kind, ctx.tick, false, true);
+            (art.rows, art.primary, art.accent, art.skin)
+        } else {
+            (
+                BELL_PORTRAIT,
+                (132, 104, 64),
+                (244, 210, 112),
+                (244, 210, 112),
+            )
+        };
+    let primary = visual::grade_art(ctx.color_filter, primary);
+    let accent = visual::grade_art(ctx.color_filter, accent);
+    let skin = visual::grade_art(ctx.color_filter, skin);
+
+    rows.iter()
+        .map(|row| {
+            let spans: Vec<Span<'static>> = row
+                .chars()
+                .map(|symbol| {
+                    let foreground = match symbol {
+                        '#' => Color::Rgb(primary.0, primary.1, primary.2),
+                        '*' | '+' => Color::Rgb(accent.0, accent.1, accent.2),
+                        '@' => Color::Rgb(skin.0, skin.1, skin.2),
+                        '.' => {
+                            let dark = visual::darken(primary, 0.58);
+                            Color::Rgb(dark.0, dark.1, dark.2)
+                        }
+                        _ => PORTRAIT_BG,
+                    };
+                    Span::styled(
+                        symbol.to_string(),
+                        Style::default().fg(foreground).bg(PORTRAIT_BG),
+                    )
+                })
+                .collect();
+            Line::from(spans)
+        })
+        .collect()
+}
+
+fn render_dialog_text(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
     let mut lines = vec![
         Line::from(Span::styled(
             ctx.dialog_npc_name,
-            Style::default().fg(NPC_COLOR).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Rgb(230, 192, 122))
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(Span::styled(
+            dialog_portrait_kind(ctx.npcs, ctx.dialog_npc_idx)
+                .map(|kind| kind.name())
+                .unwrap_or("a voice in the dark"),
+            Style::default().fg(TEXT_DIM),
         )),
         Line::from(""),
     ];
@@ -2996,12 +3367,12 @@ fn render_dialog_overlay(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
             "─ Your response ─",
-            Style::default().fg(TEXT_DIM),
+            Style::default().fg(Color::Rgb(164, 128, 78)),
         )));
         for (i, choice) in ctx.dialog_choices.iter().enumerate() {
             lines.push(Line::from(Span::styled(
                 format!("  {}. {}", i + 1, choice),
-                Style::default().fg(Color::Rgb(200, 220, 255)),
+                Style::default().fg(Color::Rgb(220, 198, 150)),
             )));
         }
         lines.push(Line::from(""));
@@ -3017,8 +3388,16 @@ fn render_dialog_overlay(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
         )));
     }
 
-    let p = Paragraph::new(lines).wrap(Wrap { trim: true });
-    frame.render_widget(p, inner);
+    let p = Paragraph::new(lines)
+        .wrap(Wrap { trim: true })
+        .style(Style::default().bg(DIALOG_BG));
+    frame.render_widget(p, area);
+}
+
+fn wrapped_dialog_line_count(line: &str, width: u16) -> u16 {
+    let width = usize::from(width.max(1));
+    let chars = line.chars().count().max(1);
+    chars.div_ceil(width) as u16
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -3200,4 +3579,24 @@ fn centered_rect(area: Rect, width: u16, height: u16) -> Rect {
     let x = area.x + (area.width.saturating_sub(width)) / 2;
     let y = area.y + (area.height.saturating_sub(height)) / 2;
     Rect::new(x, y, width.min(area.width), height.min(area.height))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dialogue_portrait_resolves_the_exact_active_npc() {
+        let npcs = vec![
+            Npc::new(2, 2, NpcKind::WatchCaptain),
+            Npc::new(3, 2, NpcKind::LanternTender),
+        ];
+
+        assert_eq!(
+            dialog_portrait_kind(&npcs, Some(1)),
+            Some(NpcKind::LanternTender)
+        );
+        assert_eq!(dialog_portrait_kind(&npcs, Some(9)), None);
+        assert_eq!(dialog_portrait_kind(&npcs, None), None);
+    }
 }

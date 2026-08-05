@@ -1,21 +1,24 @@
 use color_eyre::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
-use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
+use rand_chacha::ChaCha12Rng;
 use ratatui::DefaultTerminal;
 use std::time::Duration;
 
 use crate::campaign::{self, CampaignObjective, CampaignState};
 use crate::combat;
 use crate::entity::{
-    Camp, Discipline, Item, ItemKind, Landmark, Monster, MonsterKind, Npc, NpcKind, Player,
-    Projectile, TechniqueKind,
+    Camp, Discipline, IntentKind, Item, ItemKind, Landmark, Monster, MonsterKind, Npc, NpcKind,
+    Player, Projectile, TechniqueKind, ThreatIntent, WeaponMastery,
 };
 use crate::fov;
 use crate::input::{self, Action, InventoryAction};
 use crate::inventory;
 use crate::logging::GameEvent;
-use crate::map::{Map, Tile};
+use crate::map::{
+    DecorationAnchor, Map, MapTheme, PropKind, SurfaceKind, SurfaceMaterial, Tile, WorldLink,
+    WorldMapId,
+};
 use crate::monster_ai;
 use crate::narrative;
 use crate::pathfinding;
@@ -31,12 +34,52 @@ const MAP_WIDTH: i32 = 80;
 const MAP_HEIGHT: i32 = 50;
 const FOV_RADIUS: i32 = 8;
 const MAX_DEPTH: u32 = 4;
-pub(crate) const CURRENT_RULES_VERSION: u8 = 2;
+pub(crate) const CURRENT_RULES_VERSION: u8 = 3;
 const TICK_MS: u64 = 33;
 pub(crate) const HINT_INTERACT: u8 = 1;
 pub(crate) const HINT_NAVIGATION: u8 = 1 << 1;
 pub(crate) const HINT_MAP: u8 = 1 << 2;
 pub(crate) const HINT_INVENTORY: u8 = 1 << 3;
+
+fn medieval_world_links() -> Vec<WorldLink> {
+    vec![
+        WorldLink::new(
+            WorldMapId::Village,
+            (40, 25),
+            WorldMapId::OldKingsRoad,
+            (3, 25),
+        ),
+        WorldLink::new(
+            WorldMapId::OldKingsRoad,
+            (76, 25),
+            WorldMapId::BellLineGate,
+            (3, 25),
+        ),
+        WorldLink::new(
+            WorldMapId::BellLineGate,
+            (40, 46),
+            WorldMapId::Dungeon { depth: 0 },
+            (40, 3),
+        ),
+        WorldLink::new(
+            WorldMapId::Dungeon { depth: 0 },
+            (40, 46),
+            WorldMapId::OldKingsRoad,
+            (76, 25),
+        ),
+    ]
+}
+
+fn world_map_id_for(theme: MapTheme, depth: u32) -> WorldMapId {
+    match theme {
+        MapTheme::Village => WorldMapId::Village,
+        MapTheme::Road => WorldMapId::OldKingsRoad,
+        MapTheme::Ruins | MapTheme::Shrine => WorldMapId::BellLineGate,
+        MapTheme::Dungeon => WorldMapId::Dungeon {
+            depth: depth.min(MAX_DEPTH) as u8,
+        },
+    }
+}
 
 macro_rules! draw {
     ($self:expr) => {
@@ -52,6 +95,8 @@ macro_rules! draw {
             };
             let ctx = render::RenderCtx {
                 map: &$self.state.map,
+                world_map_id: $self.state.world_map_id,
+                world_links: &$self.state.world_links,
                 player: &$self.state.player,
                 monsters: &$self.state.monsters,
                 items: &$self.state.items,
@@ -66,6 +111,8 @@ macro_rules! draw {
                 stats: &$self.state.stats,
                 seed: $self.state.seed,
                 challenge_mode: $self.state.challenge_mode,
+                floor_memory: &$self.state.floor_memory,
+                cached_floor_count: $self.state.floor_cache.len(),
                 completed_runs: $self.run_history.len(),
                 run_history: &$self.run_history,
                 inventory_cursor: $self.state.inventory_cursor,
@@ -74,6 +121,7 @@ macro_rules! draw {
                 visual: &$self.visual,
                 tick: $self.visual.tick,
                 dialog_npc_name: &$self.state.dialog_npc_name,
+                dialog_npc_idx: $self.state.dialog_npc_idx,
                 dialog_text: &$self.state.dialog_text,
                 dialog_show_choices: $self.state.dialog_show_choices,
                 dialog_choices: &$self.state.dialog_choices,
@@ -196,6 +244,7 @@ pub enum GameStatus {
 pub(crate) enum PreparationMenu {
     Camp(usize),
     Shrine(usize),
+    Mastery(ItemKind),
 }
 
 // ── Run stats ──
@@ -267,9 +316,14 @@ pub enum FovDirty {
 
 // ── Headless game state ──
 pub struct GameState {
-    pub(crate) rng: StdRng,
+    pub(crate) rng: ChaCha12Rng,
     pub(crate) seed: u64,
     pub(crate) map: Map,
+    /// Named location for the connected medieval route. The current floor
+    /// snapshot remains the authoritative runtime map.
+    pub(crate) world_map_id: WorldMapId,
+    /// Authored route links are static metadata, not another RNG source.
+    pub(crate) world_links: Vec<WorldLink>,
     pub(crate) player: Player,
     pub(crate) monsters: Vec<Monster>,
     pub(crate) items: Vec<Item>,
@@ -304,6 +358,13 @@ pub struct GameState {
     pub(crate) dialog_campaign_npc: Option<crate::campaign::CampaignNpc>,
     /// Camps on the current floor.
     pub(crate) camps: Vec<Camp>,
+    /// Compact memory for the active floor. The world snapshot itself lives
+    /// in `floor_cache` when the player leaves a classic floor.
+    pub(crate) floor_memory: crate::floor::FloorMemory,
+    /// Visited classic floors, capped by `MAX_CACHED_FLOORS`.
+    pub(crate) floor_cache: Vec<crate::floor::FloorState>,
+    /// Set only by a committed gameplay action and consumed by `end_turn`.
+    pending_noise: Option<crate::floor::NoiseKind>,
     pub(crate) seen_monsters: std::collections::HashSet<crate::entity::MonsterKind>,
     pub(crate) defeated_monsters: std::collections::HashSet<crate::entity::MonsterKind>,
     pub(crate) preparation_menu: Option<PreparationMenu>,
@@ -346,11 +407,13 @@ pub(crate) fn crown_pursuit_act_chance(base: f64, depth: u32) -> f64 {
 
 impl GameState {
     pub fn new(seed: u64) -> Self {
-        let rng = StdRng::seed_from_u64(seed);
+        let rng = ChaCha12Rng::seed_from_u64(seed);
         Self {
             rng,
             seed,
-            map: Map::new(MAP_WIDTH, MAP_HEIGHT),
+            map: Map::with_theme(MAP_WIDTH, MAP_HEIGHT, MapTheme::Dungeon),
+            world_map_id: WorldMapId::Dungeon { depth: 0 },
+            world_links: medieval_world_links(),
             player: Player::new(0, 0),
             monsters: Vec::new(),
             items: Vec::new(),
@@ -378,6 +441,9 @@ impl GameState {
             dialog_choices: Vec::new(),
             dialog_campaign_npc: None,
             camps: Vec::new(),
+            floor_memory: crate::floor::FloorMemory::default(),
+            floor_cache: Vec::new(),
+            pending_noise: None,
             seen_monsters: std::collections::HashSet::new(),
             defeated_monsters: std::collections::HashSet::new(),
             preparation_menu: None,
@@ -391,10 +457,18 @@ impl GameState {
 
     // ── Game lifecycle ──
     pub fn new_game(&mut self) {
-        // A manually started run always uses the current rules. Replay playback
-        // restores its recorded version after generation for compatibility.
-        self.rules_version = CURRENT_RULES_VERSION;
-        self.rng = StdRng::seed_from_u64(self.seed);
+        self.start_new_game(CURRENT_RULES_VERSION);
+    }
+
+    /// Start a replay using the rules that were recorded with it. This keeps
+    /// legacy replays on their original generation and combat branches.
+    pub(crate) fn new_game_with_rules(&mut self, rules_version: u8) {
+        self.start_new_game(rules_version);
+    }
+
+    fn start_new_game(&mut self, rules_version: u8) {
+        self.rules_version = rules_version;
+        self.rng = ChaCha12Rng::seed_from_u64(self.seed);
         self.player = Player::new(0, 0);
         self.monsters.clear();
         self.items.clear();
@@ -416,6 +490,9 @@ impl GameState {
         self.dialog_choices.clear();
         self.dialog_campaign_npc = None;
         self.camps.clear();
+        self.floor_memory = crate::floor::FloorMemory::default();
+        self.floor_cache.clear();
+        self.pending_noise = None;
         self.seen_monsters.clear();
         self.defeated_monsters.clear();
         self.preparation_menu = None;
@@ -448,9 +525,10 @@ impl GameState {
         let spec = campaign::chapter1_level_spec(camp_level);
         let depth = spec.as_ref().map(|level| level.depth).unwrap_or(camp_level);
 
-        self.map = Map::new(MAP_WIDTH, MAP_HEIGHT);
+        self.map = Map::with_theme(MAP_WIDTH, MAP_HEIGHT, MapTheme::Dungeon);
         let place_down = depth < MAX_DEPTH;
         self.map.generate(&mut self.rng, place_down);
+        self.floor_memory.reset_for_rooms(self.map.rooms.len());
 
         let room_count = self.map.rooms.len();
 
@@ -879,6 +957,7 @@ impl GameState {
 
         self.place_dungeon_objects(depth, &mut occupied);
         self.place_environmental_terrain(depth, &occupied);
+        self.apply_medieval_dressing(depth, Some(camp_level));
 
         self.refresh_fov();
 
@@ -898,9 +977,10 @@ impl GameState {
 
     /// Generate a level for classic (non-campaign) mode.
     pub fn generate_level(&mut self, depth: u32) {
-        self.map = Map::new(MAP_WIDTH, MAP_HEIGHT);
+        self.map = Map::with_theme(MAP_WIDTH, MAP_HEIGHT, MapTheme::Dungeon);
         let place_down = depth < MAX_DEPTH;
         self.map.generate(&mut self.rng, place_down);
+        self.floor_memory.reset_for_rooms(self.map.rooms.len());
 
         // Find stairs positions
         let mut stairs_down_pos: Option<(i32, i32)> = None;
@@ -998,6 +1078,14 @@ impl GameState {
         // Guardian boss
         if depth == MAX_DEPTH {
             spawn::spawn_guardian(&mut self.monsters, &self.map, &spawn_rooms, player_room_idx);
+            if self.rules_version >= 3 {
+                spawn::spawn_bell_warden(
+                    &mut self.monsters,
+                    &self.map,
+                    &spawn_rooms,
+                    player_room_idx,
+                );
+            }
             self.msg(
                 "An ancient presence stirs in the darkness...",
                 MsgColor::DAMAGE_TAKEN,
@@ -1126,6 +1214,7 @@ impl GameState {
 
         self.place_dungeon_objects(depth, &mut occupied);
         self.place_environmental_terrain(depth, &occupied);
+        self.apply_medieval_dressing(depth, None);
 
         self.refresh_fov();
         if depth > 0 {
@@ -1158,6 +1247,163 @@ impl GameState {
                 placed += 1;
             }
         }
+    }
+
+    /// Dress the generated floor with a deterministic medieval visual layer.
+    ///
+    /// `Tile` remains authoritative for movement and FOV. These surfaces and
+    /// props are deliberately separate so the presentation can become richer
+    /// without making seeded combat or pathfinding depend on decoration.
+    fn apply_medieval_dressing(&mut self, depth: u32, campaign_level: Option<u32>) {
+        let theme = match campaign_level {
+            Some(0) => MapTheme::Village,
+            Some(1) => MapTheme::Road,
+            Some(2) => MapTheme::Ruins,
+            Some(_) => MapTheme::Dungeon,
+            None => match depth {
+                0 => MapTheme::Village,
+                1 => MapTheme::Road,
+                2 => MapTheme::Ruins,
+                _ => MapTheme::Dungeon,
+            },
+        };
+        self.map.theme = theme;
+        self.world_map_id = world_map_id_for(theme, depth);
+
+        let base_surface = match theme {
+            MapTheme::Village => SurfaceKind::Ground(SurfaceMaterial::Grass),
+            MapTheme::Road => SurfaceKind::Ground(SurfaceMaterial::Dirt),
+            MapTheme::Ruins => SurfaceKind::Floor(SurfaceMaterial::Moss),
+            MapTheme::Shrine => SurfaceKind::Floor(SurfaceMaterial::Timber),
+            MapTheme::Dungeon => SurfaceKind::Floor(SurfaceMaterial::Stone),
+        };
+        let size = (self.map.width * self.map.height) as usize;
+        self.map.surfaces = Some(vec![base_surface; size]);
+        for index in 0..size {
+            if self.map.tiles[index] == Tile::Wall {
+                continue;
+            }
+            let x = index as i32 % self.map.width;
+            let y = index as i32 / self.map.width;
+            let surface = if theme == MapTheme::Road
+                && self.map.tiles[index] == Tile::Floor
+                && (x * 31 + y * 17 + depth as i32).rem_euclid(19) == 0
+            {
+                SurfaceKind::Mud
+            } else {
+                base_surface
+            };
+            self.map
+                .surfaces
+                .as_mut()
+                .expect("surface layer was just created")[index] = surface;
+        }
+
+        let mut rooms = self.map.rooms.clone();
+        rooms.sort_by_key(|room| (room.y, room.x));
+        let road_surface = match theme {
+            MapTheme::Village => SurfaceKind::Road(SurfaceMaterial::Cobblestone),
+            MapTheme::Road => SurfaceKind::Road(SurfaceMaterial::Dirt),
+            _ => SurfaceKind::Road(SurfaceMaterial::Stone),
+        };
+        let mut road_anchors = Vec::new();
+        for (pair_index, pair) in rooms.windows(2).enumerate() {
+            let (mut x, mut y) = pair[0].center();
+            let (target_x, target_y) = pair[1].center();
+            while x != target_x {
+                if self.map.is_walkable(x, y) {
+                    self.map.set_surface(x, y, road_surface);
+                    if (x + y + pair_index as i32).rem_euclid(7) == 0 {
+                        road_anchors.push(DecorationAnchor::road(x, y));
+                    }
+                }
+                x += (target_x - x).signum();
+            }
+            while y != target_y {
+                if self.map.is_walkable(x, y) {
+                    self.map.set_surface(x, y, road_surface);
+                    if (x + y + pair_index as i32).rem_euclid(7) == 0 {
+                        road_anchors.push(DecorationAnchor::road(x, y));
+                    }
+                }
+                y += (target_y - y).signum();
+            }
+            if self.map.is_walkable(target_x, target_y) {
+                self.map.set_surface(target_x, target_y, road_surface);
+            }
+        }
+
+        let mut anchors = road_anchors;
+        anchors.extend(
+            rooms
+                .iter()
+                .map(|room| DecorationAnchor::landmark(room.center().0, room.center().1)),
+        );
+        self.map
+            .place_seeded_decorations(self.seed ^ u64::from(depth) ^ 0x4D45_4449_4556, &anchors);
+
+        let mut reserved = std::collections::HashSet::new();
+        reserved.insert((self.player.x, self.player.y));
+        reserved.extend(self.monsters.iter().map(|monster| (monster.x, monster.y)));
+        reserved.extend(self.items.iter().map(|item| (item.x, item.y)));
+        reserved.extend(self.npcs.iter().map(|npc| (npc.x, npc.y)));
+        reserved.extend(self.camps.iter().map(|camp| (camp.x, camp.y)));
+        let map_width = self.map.width;
+        let map_height = self.map.height;
+        let tiles = self.map.tiles.clone();
+        self.map.props.retain(|prop| {
+            let walkable = prop.x >= 0
+                && prop.x < map_width
+                && prop.y >= 0
+                && prop.y < map_height
+                && !matches!(
+                    tiles[(prop.y * map_width + prop.x) as usize],
+                    Tile::Wall | Tile::DoorClosed | Tile::LockedDoor | Tile::Urn | Tile::Barricade
+                );
+            walkable && !reserved.contains(&prop.position())
+        });
+
+        for (room_index, room) in rooms.iter().enumerate() {
+            let (cx, cy) = room.center();
+            let (dx, dy) = if room_index % 2 == 0 { (1, 0) } else { (0, 1) };
+            let position = (cx + dx, cy + dy);
+            let kind = match theme {
+                MapTheme::Village => match room_index % 3 {
+                    0 => PropKind::Cart,
+                    1 => PropKind::Barrel,
+                    _ => PropKind::Banner,
+                },
+                MapTheme::Road => match room_index % 3 {
+                    0 => PropKind::Gate,
+                    1 => PropKind::Crate,
+                    _ => PropKind::Torch,
+                },
+                MapTheme::Ruins => match room_index % 3 {
+                    0 => PropKind::Rubble,
+                    1 => PropKind::Tree,
+                    _ => PropKind::Brazier,
+                },
+                MapTheme::Shrine | MapTheme::Dungeon => match room_index % 3 {
+                    0 => PropKind::Torch,
+                    1 => PropKind::Barrel,
+                    _ => PropKind::Rubble,
+                },
+            };
+            if self.map.in_bounds(position.0, position.1)
+                && self.map.is_walkable(position.0, position.1)
+                && !reserved.contains(&position)
+                && !self
+                    .map
+                    .props
+                    .iter()
+                    .any(|prop| prop.position() == position)
+            {
+                self.map.props.push(crate::map::EnvironmentProp::new(
+                    position.0, position.1, kind,
+                ));
+            }
+        }
+        self.map.props.sort_by_key(|prop| (prop.y, prop.x));
     }
 
     fn place_dungeon_objects(&mut self, depth: u32, occupied: &mut [bool]) {
@@ -1239,6 +1485,117 @@ impl GameState {
         }
     }
 
+    fn action_noise(action: Action) -> crate::floor::NoiseKind {
+        match action {
+            Action::Wait
+            | Action::PickUp
+            | Action::Talk
+            | Action::TalkAt(_, _)
+            | Action::ConversationChoice(_)
+            | Action::Listen(_, _)
+            | Action::Interact
+            | Action::None
+            | Action::Inventory
+            | Action::QuestPanel
+            | Action::TogglePickup
+            | Action::SaveGame
+            | Action::LoadGame
+            | Action::Quit => crate::floor::NoiseKind::Quiet,
+            Action::Move(_, _)
+            | Action::Dodge(_, _)
+            | Action::AutoExplore
+            | Action::Descend
+            | Action::Ascend => crate::floor::NoiseKind::Movement,
+            Action::Technique(_, _) | Action::ToggleDoor(_, _) | Action::Disarm(_, _) => {
+                crate::floor::NoiseKind::Impact
+            }
+        }
+    }
+
+    fn attention_band(attention: u8) -> u8 {
+        match attention {
+            0..=24 => 0,
+            25..=59 => 1,
+            60..=84 => 2,
+            _ => 3,
+        }
+    }
+
+    fn advance_floor_memory(&mut self, noise: crate::floor::NoiseKind) {
+        if self.rules_version < 3 || self.map.rooms.is_empty() {
+            return;
+        }
+
+        let old_band = Self::attention_band(self.floor_memory.attention);
+        if noise == crate::floor::NoiseKind::Quiet {
+            self.floor_memory.quiet_turns = self.floor_memory.quiet_turns.saturating_add(1);
+            if self.floor_memory.quiet_turns >= 5 {
+                self.floor_memory.quiet_turns = 0;
+                self.floor_memory.attention = self.floor_memory.attention.saturating_sub(1);
+                for alert in &mut self.floor_memory.room_alert {
+                    *alert = alert.saturating_sub(1);
+                }
+            }
+        } else {
+            self.floor_memory.quiet_turns = 0;
+            self.floor_memory.attention = self
+                .floor_memory
+                .attention
+                .saturating_add(noise.attention())
+                .min(100);
+            self.floor_memory.last_noise = Some(crate::floor::NoiseEvent {
+                x: self.player.x,
+                y: self.player.y,
+                kind: noise,
+            });
+
+            if let Some(room_index) = self.map.rooms.iter().position(|room| {
+                self.player.x >= room.x
+                    && self.player.x < room.x + room.w
+                    && self.player.y >= room.y
+                    && self.player.y < room.y + room.h
+            }) {
+                let increase = u8::from(noise == crate::floor::NoiseKind::Alarm).saturating_add(1);
+                self.floor_memory.room_alert[room_index] = self.floor_memory.room_alert[room_index]
+                    .saturating_add(increase)
+                    .min(3);
+            }
+        }
+
+        let new_band = Self::attention_band(self.floor_memory.attention);
+        if new_band > old_band {
+            let message = match new_band {
+                1 => "The dungeon grows watchful.",
+                2 => "Something in the dark starts hunting your trail.",
+                _ => "The whole floor seems to hear you.",
+            };
+            self.msg(message, MsgColor::DAMAGE_TAKEN);
+        }
+
+        if new_band >= 1 {
+            for monster in &mut self.monsters {
+                if !monster.alive {
+                    continue;
+                }
+                let same_room = self.map.rooms.iter().any(|room| {
+                    self.player.x >= room.x
+                        && self.player.x < room.x + room.w
+                        && self.player.y >= room.y
+                        && self.player.y < room.y + room.h
+                        && monster.x >= room.x
+                        && monster.x < room.x + room.w
+                        && monster.y >= room.y
+                        && monster.y < room.y + room.h
+                });
+                if same_room && self.floor_memory.attention >= 25 {
+                    monster.last_seen_player_x = self.player.x;
+                    monster.last_seen_player_y = self.player.y;
+                    monster.alert_turns = monster.alert_turns.max(3);
+                }
+            }
+        }
+    }
+
     // (spawning helpers moved to crate::spawn)
 
     // ── Turn processing ──
@@ -1246,6 +1603,7 @@ impl GameState {
         if self.status != GameStatus::Playing {
             return;
         }
+        self.pending_noise = Some(Self::action_noise(action));
         if self.rules_version >= 2 && self.player.pending_level_ups > 0 {
             self.msg("Choose a discipline before acting.", MsgColor::SYSTEM);
             return;
@@ -1322,9 +1680,13 @@ impl GameState {
                                         needed: 3,
                                     });
                             }
-                            visual.add_effect(VisualEffect::pickup_sparkle(
+                            visual.start_player_action(PlayerActionKind::UseItem(
+                                ItemKind::LanternOil,
+                            ));
+                            visual.add_effect(VisualEffect::item_cast(
                                 self.player.x,
                                 self.player.y,
+                                ItemKind::LanternOil,
                             ));
                         } else {
                             self.msg(
@@ -1404,6 +1766,7 @@ impl GameState {
                     return;
                 }
                 Tile::Urn => {
+                    self.pending_noise = Some(crate::floor::NoiseKind::Impact);
                     self.stats.objects_smashed += 1;
                     let index = self.map.idx(nx, ny);
                     self.map.tiles[index] = Tile::Floor;
@@ -1424,6 +1787,7 @@ impl GameState {
                     return;
                 }
                 Tile::Barricade => {
+                    self.pending_noise = Some(crate::floor::NoiseKind::Impact);
                     self.stats.objects_smashed += 1;
                     let index = self.map.idx(nx, ny);
                     self.map.tiles[index] = Tile::Floor;
@@ -1451,6 +1815,7 @@ impl GameState {
 
         // ── Door opening ──
         if self.map.open_door(nx, ny) {
+            self.pending_noise = Some(crate::floor::NoiseKind::Impact);
             self.msg("You open the door.", MsgColor::SYSTEM);
             self.fov_dirty = FovDirty::MapChanged;
             self.end_turn(visual);
@@ -1469,6 +1834,7 @@ impl GameState {
             .iter()
             .position(|m| m.alive && m.x == nx && m.y == ny)
         {
+            self.pending_noise = Some(crate::floor::NoiseKind::Impact);
             let attack_cost = match self.player.weapon {
                 Some(ItemKind::Warhammer) => 3,
                 Some(ItemKind::Longsword | ItemKind::Emberbrand) => 2,
@@ -1487,11 +1853,17 @@ impl GameState {
             }
             // Awaken stationary monsters (mimics, sentinels) on first hit.
             self.monsters[idx].awakened = true;
+            self.monsters[idx].intent = None;
 
             let mut dmg = combat::resolve_attack(
                 self.player.total_attack(),
                 self.monsters[idx].stats.defense,
             );
+            if self.player.weapon_mastery == Some(WeaponMastery::KeenEdge)
+                && self.monsters[idx].stats.hp * 2 > self.monsters[idx].stats.max_hp
+            {
+                dmg += 1;
+            }
             if self.player.weapon == Some(ItemKind::Longsword)
                 && self.monsters[idx].stats.hp * 2 <= self.monsters[idx].stats.max_hp
             {
@@ -1510,6 +1882,14 @@ impl GameState {
             }
             if counter {
                 dmg += 3 + i32::from(self.player.resolve_rank) * i32::from(self.rules_version >= 2);
+                if self.player.weapon_mastery == Some(WeaponMastery::Riposte) {
+                    dmg += 2;
+                }
+            }
+            if self.player.weapon_mastery == Some(WeaponMastery::HammerBreaker)
+                && self.player.weapon == Some(ItemKind::Warhammer)
+            {
+                dmg += 1;
             }
             if interrupted {
                 dmg += 3;
@@ -1527,6 +1907,14 @@ impl GameState {
             visual.start_player_action(PlayerActionKind::Attack {
                 weapon: self.player.weapon,
             });
+            visual.add_effect(VisualEffect::weapon_sweep(
+                m.x,
+                m.y,
+                dx,
+                dy,
+                self.player.weapon,
+                counter,
+            ));
             visual.add_effect(VisualEffect::attack_flash(m.x, m.y));
             visual.add_effect(VisualEffect::damage_number(m.x, m.y, dmg));
 
@@ -1629,23 +2017,34 @@ impl GameState {
             let from = (self.player.x, self.player.y);
             self.player.x = nx;
             self.player.y = ny;
-            self.on_player_entered_tile(nx, ny, from, visual);
+            self.on_player_entered_tile(nx, ny, from, false, visual);
             if !self.player.alive {
                 return;
             }
             let terrain = self.map.tiles[self.map.idx(nx, ny)];
+            let terrain_slow = terrain.movement_class() == crate::map::MovementClass::Slow
+                && terrain.movement_cost() > 1
+                && !terrain.blocks_fov();
+            let surface_slow = self.map.surface_at(nx, ny).is_some_and(|surface| {
+                surface.movement_cost() > 1
+                    && !surface.blocks_fov()
+                    && surface.terrain_rules().movement == crate::map::MovementClass::Slow
+            }) && !terrain_slow;
             if terrain == Tile::Web {
                 let index = self.map.idx(nx, ny);
                 self.map.tiles[index] = Tile::Floor;
                 self.msg("You tear free of clinging webbing.", MsgColor::DIM);
             } else if terrain == Tile::ShallowWater {
                 self.msg("Cold water drags at every step.", MsgColor::DIM);
+            } else if surface_slow {
+                self.msg("Mud grips your boots.", MsgColor::DIM);
             }
             self.end_turn(visual);
             if self.player.alive
                 && (terrain == Tile::Web
                     || (terrain == Tile::ShallowWater
-                        && self.player.armor != Some(ItemKind::TideglassMail)))
+                        && self.player.armor != Some(ItemKind::TideglassMail))
+                    || surface_slow)
             {
                 self.end_turn(visual);
             }
@@ -1691,7 +2090,7 @@ impl GameState {
         let from = (self.player.x, self.player.y);
         self.player.x = nx;
         self.player.y = ny;
-        self.on_player_entered_tile(nx, ny, from, visual);
+        self.on_player_entered_tile(nx, ny, from, true, visual);
         if self.player.alive {
             self.end_turn(visual);
         }
@@ -1790,6 +2189,26 @@ impl GameState {
         let kind = item.kind;
         if kind == ItemKind::CrownOfDepth {
             self.player.crown_held = true;
+            if self.rules_version >= 3 {
+                self.floor_memory.attention = self.floor_memory.attention.max(60);
+                self.floor_memory.crown_pressure_applied = true;
+                self.floor_memory.last_noise = Some(crate::floor::NoiseEvent {
+                    x: self.player.x,
+                    y: self.player.y,
+                    kind: crate::floor::NoiseKind::Alarm,
+                });
+                for monster in &mut self.monsters {
+                    if monster.alive {
+                        monster.last_seen_player_x = self.player.x;
+                        monster.last_seen_player_y = self.player.y;
+                        monster.alert_turns = monster.alert_turns.max(5);
+                    }
+                }
+                self.msg(
+                    "The Crown's weight travels through the floor. The return route will not be quiet.",
+                    MsgColor::DAMAGE_TAKEN,
+                );
+            }
             self.msg(
                 "The Crown rests in your hands — warm, expectant, patient. Return to the surface.",
                 MsgColor::LOOT,
@@ -1809,6 +2228,7 @@ impl GameState {
         } else if item.cursed && kind.is_equippable() {
             let (_old, _) = inventory::equip_item(&mut self.player, kind, kind.is_weapon());
             if kind.is_weapon() {
+                self.player.weapon_mastery = None;
                 self.player.weapon_cursed = true;
                 self.player.weapon_durability = kind.max_durability();
             } else {
@@ -1823,6 +2243,9 @@ impl GameState {
                 || (kind.is_armor() && self.player.armor.is_none()))
         {
             let (_old, equip_msg) = inventory::equip_item(&mut self.player, kind, kind.is_weapon());
+            if kind.is_weapon() {
+                self.player.weapon_mastery = None;
+            }
             self.msg(equip_msg, MsgColor::LOOT);
         } else {
             self.player.inventory.push(kind);
@@ -1971,6 +2394,9 @@ impl GameState {
             kind if kind.is_equippable() => {
                 let (_old, equip_msg) =
                     inventory::equip_item(&mut self.player, kind, kind.is_weapon());
+                if kind.is_weapon() {
+                    self.player.weapon_mastery = None;
+                }
                 self.player.inventory.remove(slot);
                 self.msg(equip_msg, MsgColor::LOOT);
                 self.status = GameStatus::Playing;
@@ -1998,6 +2424,10 @@ impl GameState {
             }
         };
         if result {
+            if kind.requires_identification() || kind == ItemKind::LoreFragment {
+                visual.start_player_action(PlayerActionKind::UseItem(kind));
+                visual.add_effect(VisualEffect::item_cast(self.player.x, self.player.y, kind));
+            }
             crate::inventory::sort_inventory(&mut self.player);
         }
         result
@@ -2061,6 +2491,7 @@ impl GameState {
         nx: i32,
         ny: i32,
         from: (i32, i32),
+        dash: bool,
         visual: &mut VisualState,
     ) {
         self.fov_dirty = FovDirty::PlayerMoved;
@@ -2070,6 +2501,13 @@ impl GameState {
             to: (nx, ny),
             turns: self.stats.turns,
         });
+        visual.add_effect(VisualEffect::movement_trail(
+            from.0,
+            from.1,
+            nx - from.0,
+            ny - from.1,
+            dash,
+        ));
 
         let idx = self.map.idx(nx, ny);
         self.map.explored[idx] = true;
@@ -2592,6 +3030,47 @@ impl GameState {
             _ => ("", MsgColor::SYSTEM),
         };
 
+        match choice {
+            CampaignFlag::BellChoiceRung => {
+                self.floor_memory.attention = 100;
+                self.floor_memory.last_noise = Some(crate::floor::NoiseEvent {
+                    x: self.player.x,
+                    y: self.player.y,
+                    kind: crate::floor::NoiseKind::Alarm,
+                });
+                self.pending_noise = Some(crate::floor::NoiseKind::Alarm);
+                for monster in &mut self.monsters {
+                    if monster.alive {
+                        monster.awakened = true;
+                        monster.last_seen_player_x = self.player.x;
+                        monster.last_seen_player_y = self.player.y;
+                        monster.alert_turns = monster.alert_turns.max(6);
+                    }
+                }
+                self.msg(
+                    "The sound carries through every room. Nothing on this floor is asleep now.",
+                    MsgColor::DAMAGE_TAKEN,
+                );
+            }
+            CampaignFlag::BellChoiceShattered => {
+                self.floor_memory.attention = self.floor_memory.attention.saturating_sub(10);
+                self.pending_noise = Some(crate::floor::NoiseKind::Impact);
+                self.msg(
+                    "The broken bell cannot call anything else. The silence feels earned.",
+                    MsgColor::LOOT,
+                );
+            }
+            CampaignFlag::BellChoiceMuffled => {
+                self.floor_memory.attention = self.floor_memory.attention.saturating_sub(30);
+                self.player.lantern_turns = self.player.lantern_turns.max(20);
+                self.msg(
+                    "The cloth holds. For a little while, even the dark loses the route to you.",
+                    MsgColor::HEALING,
+                );
+            }
+            _ => {}
+        }
+
         for line in result.lines() {
             self.msg(line, color);
         }
@@ -2884,6 +3363,168 @@ impl GameState {
         "Complete the current objective before descending."
     }
 
+    fn snapshot_current_floor(&self) -> crate::floor::FloorState {
+        let mut used_landmarks: Vec<usize> = self.used_landmarks.iter().copied().collect();
+        used_landmarks.sort_unstable();
+        crate::floor::FloorState {
+            depth: self.player.depth,
+            map: self.map.clone(),
+            monsters: self.monsters.clone(),
+            items: self.items.clone(),
+            npcs: self.npcs.clone(),
+            projectiles: self.projectiles.clone(),
+            landmarks: self.landmarks.clone(),
+            used_landmarks,
+            camps: self.camps.clone(),
+            memory: self.floor_memory.clone(),
+        }
+    }
+
+    fn stash_current_floor(&mut self) {
+        if self.game_mode != GameMode::Classic || self.rules_version < 3 {
+            return;
+        }
+
+        let snapshot = self.snapshot_current_floor();
+        if let Some(existing) = self
+            .floor_cache
+            .iter_mut()
+            .find(|floor| floor.depth == snapshot.depth)
+        {
+            *existing = snapshot;
+            return;
+        }
+        if self.floor_cache.len() < crate::floor::MAX_CACHED_FLOORS {
+            self.floor_cache.push(snapshot);
+        }
+    }
+
+    fn restore_cached_floor(&mut self, depth: u32) -> bool {
+        let Some(index) = self
+            .floor_cache
+            .iter()
+            .position(|floor| floor.depth == depth)
+        else {
+            return false;
+        };
+
+        let floor = self.floor_cache.remove(index);
+        self.map = floor.map;
+        self.monsters = floor.monsters;
+        self.items = floor.items;
+        self.npcs = floor.npcs;
+        self.projectiles = floor.projectiles;
+        self.landmarks = floor.landmarks;
+        self.used_landmarks = floor.used_landmarks.into_iter().collect();
+        self.camps = floor.camps;
+        self.floor_memory = floor.memory;
+        if self.floor_memory.room_alert.len() != self.map.rooms.len() {
+            self.floor_memory.reset_for_rooms(self.map.rooms.len());
+        }
+        self.player.depth = depth;
+        self.reset_level_workspaces();
+        true
+    }
+
+    /// A remembered floor gets one authored consequence when the Crown comes
+    /// back through it. The stalker is deterministic and bounded by the floor
+    /// snapshot, so revisiting the same floor never turns into spawn spam.
+    fn spawn_return_stalker(&mut self) {
+        if self.rules_version < 3
+            || !self.player.crown_held
+            || self.player.depth == 0
+            || self.floor_memory.hunter_spawned
+        {
+            return;
+        }
+
+        if !self.floor_memory.crown_pressure_applied {
+            self.floor_memory.attention = self.floor_memory.attention.max(25);
+            self.floor_memory.crown_pressure_applied = true;
+        }
+
+        let player_room = self.map.rooms.iter().position(|room| {
+            self.player.x >= room.x
+                && self.player.x < room.x + room.w
+                && self.player.y >= room.y
+                && self.player.y < room.y + room.h
+        });
+        let mut candidates: Vec<usize> = (0..self.map.rooms.len())
+            .filter(|room| Some(*room) != player_room)
+            .collect();
+        candidates.sort_by_key(|room| {
+            let center = self.map.rooms[*room].center();
+            -(center.0 - self.player.x).abs() - (center.1 - self.player.y).abs()
+        });
+
+        for room_index in candidates {
+            let room = self.map.rooms[room_index];
+            let candidates = [
+                room.center(),
+                (room.x + 1, room.y + 1),
+                (room.x + room.w - 2, room.y + room.h - 2),
+            ];
+            let Some((x, y)) = candidates.into_iter().find(|&(x, y)| {
+                self.map.is_walkable(x, y)
+                    && (x, y) != (self.player.x, self.player.y)
+                    && !self
+                        .monsters
+                        .iter()
+                        .any(|monster| monster.alive && (monster.x, monster.y) == (x, y))
+                    && !self.npcs.iter().any(|npc| (npc.x, npc.y) == (x, y))
+            }) else {
+                continue;
+            };
+            let mut stalker = Monster::new(x, y, MonsterKind::Stalker);
+            let scale = 1.0 + self.player.depth as f32 * 0.15;
+            let hp = (stalker.stats.max_hp as f32 * scale).round() as i32;
+            stalker.stats.hp = hp;
+            stalker.stats.max_hp = hp;
+            stalker.awakened = true;
+            stalker.last_seen_player_x = self.player.x;
+            stalker.last_seen_player_y = self.player.y;
+            stalker.alert_turns = 8;
+            stalker.intent = Some(ThreatIntent {
+                kind: IntentKind::Hunt,
+                target_x: self.player.x,
+                target_y: self.player.y,
+                power: 2,
+                turns: 0,
+            });
+            self.monsters.push(stalker);
+            self.floor_memory.hunter_spawned = true;
+            self.msg(
+                "The floor remembers your footsteps. Something follows them back.",
+                MsgColor::DAMAGE_TAKEN,
+            );
+            return;
+        }
+    }
+
+    fn reset_level_workspaces(&mut self) {
+        self.astar = pathfinding::AStarWorkspace::new(self.map.width, self.map.height);
+        let size = (self.map.width * self.map.height) as usize;
+        self.explore_visited = vec![false; size];
+        self.occupancy = vec![None; size];
+        self.flow_dist = vec![i32::MAX; size];
+        self.fov_dirty = FovDirty::LevelChanged;
+        self.refresh_fov();
+    }
+
+    fn move_to_stair(&mut self, stair: Tile) -> bool {
+        for y in 0..self.map.height {
+            for x in 0..self.map.width {
+                if self.map.tiles[self.map.idx(x, y)] == stair {
+                    self.player.x = x;
+                    self.player.y = y;
+                    self.reset_level_workspaces();
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     pub fn try_descend(&mut self, visual: &mut VisualState) {
         if self.map.tiles[self.map.idx(self.player.x, self.player.y)] == Tile::StairsDown {
             // Campaign mode: check objective completion before descent
@@ -2950,7 +3591,18 @@ impl GameState {
             } else {
                 let from = self.player.depth;
                 visual.add_effect(VisualEffect::stairs_transition());
-                self.generate_level(self.player.depth + 1);
+                let next_depth = self.player.depth + 1;
+                self.stash_current_floor();
+                if self.rules_version >= 3 && self.restore_cached_floor(next_depth) {
+                    self.move_to_stair(Tile::StairsUp);
+                    self.spawn_return_stalker();
+                    self.msg(
+                        "The remembered stairs open into a place you have already disturbed.",
+                        MsgColor::SYSTEM,
+                    );
+                } else {
+                    self.generate_level(next_depth);
+                }
                 crate::logging::game_event(GameEvent::Descend {
                     from_depth: from,
                     to_depth: self.player.depth,
@@ -2988,7 +3640,18 @@ impl GameState {
                 }
                 let from = self.player.depth;
                 visual.add_effect(VisualEffect::stairs_transition());
-                self.generate_level(self.player.depth.saturating_sub(1));
+                let target_depth = self.player.depth.saturating_sub(1);
+                self.stash_current_floor();
+                if self.rules_version >= 3 && self.restore_cached_floor(target_depth) {
+                    self.move_to_stair(Tile::StairsDown);
+                    self.spawn_return_stalker();
+                    self.msg(
+                        "You climb back into the floor you left behind.",
+                        MsgColor::SYSTEM,
+                    );
+                } else {
+                    self.generate_level(target_depth);
+                }
                 // Crown-aware ascent message
                 if self.player.crown_held {
                     self.msg(narrative::ascent_line(self.player.depth), MsgColor::SYSTEM);
@@ -3039,6 +3702,19 @@ impl GameState {
             return;
         }
 
+        // A non-telegraphed intent is only a one-turn read. Heavy windups
+        // survive until they are interrupted or land.
+        for monster in &mut self.monsters {
+            if monster.windup == 0 {
+                monster.intent = None;
+            }
+        }
+
+        let noise = self
+            .pending_noise
+            .take()
+            .unwrap_or(crate::floor::NoiseKind::Quiet);
+        self.advance_floor_memory(noise);
         self.stats.turns += 1;
         self.close_dialog_if_far();
 
@@ -3209,8 +3885,16 @@ impl GameState {
                     damage: 6,
                     lifetime: 8,
                 });
+                visual.add_effect(VisualEffect::monster_cast(m.x, m.y, m.kind, odx, ody));
                 visual.add_effect(VisualEffect::projectile_launch(m.x, m.y, odx, ody));
             }
+            self.monsters[mi].intent = Some(ThreatIntent {
+                kind: IntentKind::Cast,
+                target_x: self.player.x,
+                target_y: self.player.y,
+                power: bolt_count as u8,
+                turns: 0,
+            });
             self.monsters[mi].attack_cooldown = 3 + self.rng.gen_range(0..=2);
             self.msg(
                 format!(
@@ -3320,6 +4004,11 @@ impl GameState {
                             && m.stats.hp * 2 <= m.stats.max_hp
                         {
                             "Crown chains uncoil. Break the reach or evade!".to_string()
+                        } else if self.rules_version >= 3 && m.kind == MonsterKind::BellWarden {
+                            "The bell warden draws back. Break the resonant blow!".to_string()
+                        } else if self.rules_version >= 3 && m.kind == MonsterKind::Stalker {
+                            "The stalker folds into your blind side. Move or interrupt it!"
+                                .to_string()
                         } else {
                             format!("The {} draws back for a crushing blow!", m.kind.name())
                         };
@@ -3489,6 +4178,7 @@ impl GameState {
         for index in clear_windups {
             if let Some(monster) = self.monsters.get_mut(index) {
                 monster.windup = 0;
+                monster.intent = None;
             }
         }
         for index in clear_staggers {
@@ -3511,9 +4201,50 @@ impl GameState {
         for (index, x, y, message) in windups {
             if let Some(monster) = self.monsters.get_mut(index) {
                 monster.windup = 1;
+                monster.intent = Some(ThreatIntent {
+                    kind: if monster.kind == MonsterKind::BellWarden {
+                        IntentKind::Ring
+                    } else {
+                        IntentKind::Strike
+                    },
+                    target_x: self.player.x,
+                    target_y: self.player.y,
+                    power: monster_attack_power(monster, self.rules_version).clamp(0, 255) as u8,
+                    turns: 1,
+                });
             }
             visual.add_effect(VisualEffect::monster_attack_flash(x, y));
             self.msg(message, MsgColor::DAMAGE_TAKEN);
+        }
+
+        if self.rules_version >= 3 {
+            for monster in &mut self.monsters {
+                if !monster.alive || monster.windup > 0 || monster.intent.is_some() {
+                    continue;
+                }
+                let distance =
+                    (monster.x - self.player.x).abs() + (monster.y - self.player.y).abs();
+                let kind = if monster.kind == MonsterKind::Sentinel {
+                    IntentKind::Guard
+                } else if matches!(monster.kind, MonsterKind::Rat | MonsterKind::Goblin)
+                    && monster.stats.hp * 10 <= monster.stats.max_hp * 3
+                {
+                    IntentKind::Retreat
+                } else if monster.kind == MonsterKind::Necromancer {
+                    IntentKind::Cast
+                } else if distance <= 1 {
+                    IntentKind::Strike
+                } else {
+                    IntentKind::Hunt
+                };
+                monster.intent = Some(ThreatIntent {
+                    kind,
+                    target_x: self.player.x,
+                    target_y: self.player.y,
+                    power: monster_attack_power(monster, self.rules_version).clamp(0, 255) as u8,
+                    turns: 0,
+                });
+            }
         }
 
         crate::ai::compute_flow(
@@ -3766,7 +4497,9 @@ impl GameState {
     pub fn save_game(&self) -> std::io::Result<()> {
         let data = crate::save::SaveData::from_state(self);
         let json = serde_json::to_string_pretty(&data).map_err(std::io::Error::other)?;
-        std::fs::write(crate::save::SAVE_PATH, json)
+        let temp_path = format!("{}.tmp", crate::save::SAVE_PATH);
+        std::fs::write(&temp_path, json)?;
+        std::fs::rename(temp_path, crate::save::SAVE_PATH)
     }
 
     pub fn load_game(&mut self) {
@@ -3807,6 +4540,8 @@ impl GameState {
         self.landmarks = data.landmarks;
         self.used_landmarks = data.used_landmarks.into_iter().collect();
         self.camps = data.camps;
+        self.floor_cache = data.floor_cache;
+        self.floor_memory = data.floor_memory;
         self.dialog_active = false;
         self.dialog_text.clear();
         self.dialog_npc_name.clear();
@@ -3816,6 +4551,7 @@ impl GameState {
         self.dialog_choices.clear();
         self.dialog_campaign_npc = None;
         self.log_scroll = 0;
+        self.pending_noise = None;
         self.seen_monsters = data.seen_monsters.into_iter().collect();
         self.defeated_monsters = data.defeated_monsters.into_iter().collect();
         self.status = data.status;
@@ -3826,22 +4562,21 @@ impl GameState {
         self.challenge_mode = data.challenge_mode;
         self.rules_version = crate::save::rules_version_for_save(data.version);
         self.campaign = data.campaign;
+        self.world_map_id = world_map_id_for(self.map.theme, self.player.depth);
+        self.world_links = medieval_world_links();
         self.inventory_cursor = 0;
         self.preparation_menu = None;
 
-        self.rng = StdRng::seed_from_u64(self.seed);
-        for _ in 0..self.stats.turns {
-            let _: u64 = self.rng.gen();
+        self.rng = ChaCha12Rng::seed_from_u64(self.seed);
+        if let Some(word_pos) = data.rng_word_pos {
+            self.rng.set_word_pos(word_pos);
+        } else {
+            for _ in 0..self.stats.turns {
+                let _: u64 = self.rng.gen();
+            }
         }
 
-        self.astar = pathfinding::AStarWorkspace::new(self.map.width, self.map.height);
-        let size = (self.map.width * self.map.height) as usize;
-        self.explore_visited = vec![false; size];
-        self.occupancy = vec![None; size];
-        self.flow_dist = vec![i32::MAX; size];
-
-        self.fov_dirty = FovDirty::LevelChanged;
-        self.refresh_fov();
+        self.reset_level_workspaces();
         self.msg("Game loaded.", MsgColor::SYSTEM);
 
         if self.status == GameStatus::Menu {
@@ -3952,6 +4687,7 @@ impl GameState {
     }
 
     fn open_locked_door(&mut self, x: i32, y: i32, visual: &mut VisualState) {
+        self.pending_noise = Some(crate::floor::NoiseKind::Impact);
         let Some(key_slot) = self
             .player
             .inventory
@@ -4009,7 +4745,11 @@ impl GameState {
                 (px + dx - right.0, py + dy - right.1),
             ],
             TechniqueKind::Earthbreak => {
-                vec![(px + dx * 2, py + dy * 2), (px + dx, py + dy)]
+                let mut cells = vec![(px + dx * 2, py + dy * 2), (px + dx, py + dy)];
+                if self.player.weapon_mastery == Some(WeaponMastery::HammerQuake) {
+                    cells.insert(0, (px + dx * 3, py + dy * 3));
+                }
+                cells
             }
             TechniqueKind::CinderArc => vec![
                 (px + dx, py + dy),
@@ -4071,6 +4811,7 @@ impl GameState {
         self.spend_player_stamina(technique.cost());
         self.stats.techniques_used += 1;
         visual.start_player_action(PlayerActionKind::Technique(technique));
+        visual.add_effect(VisualEffect::technique_cast(px, py, dx, dy, technique));
 
         if technique == TechniqueKind::Lunge && target_cells[0] == (px + dx * 2, py + dy * 2) {
             let from = (self.player.x, self.player.y);
@@ -4082,7 +4823,7 @@ impl GameState {
                 dx,
                 dy,
             ));
-            self.on_player_entered_tile(self.player.x, self.player.y, from, visual);
+            self.on_player_entered_tile(self.player.x, self.player.y, from, false, visual);
             if !self.player.alive {
                 return;
             }
@@ -4107,15 +4848,36 @@ impl GameState {
             let Some(index) = self.monster_at(x, y) else {
                 continue;
             };
-            let (bonus, stagger, fixed_damage) = match technique {
+            let (bonus, stagger, fixed_damage): (i32, u8, Option<i32>) = match technique {
                 TechniqueKind::Kick => (0, 1, Some(1)),
                 TechniqueKind::ShieldBash => (0, 3, None),
                 TechniqueKind::Lunge => (1, 1, None),
                 TechniqueKind::Sweep => (0, 1, None),
                 TechniqueKind::Earthbreak => (2, 2, None),
-                TechniqueKind::CinderArc => (2, 1, None),
+                TechniqueKind::CinderArc => (
+                    2 + i32::from(self.player.weapon_mastery == Some(WeaponMastery::EmberKindle))
+                        * 2,
+                    1,
+                    None,
+                ),
             };
-            self.hit_with_technique(index, technique, bonus, stagger, fixed_damage, visual);
+            let stagger = if self.player.weapon_mastery == Some(WeaponMastery::HammerBreaker)
+                && self.player.weapon == Some(ItemKind::Warhammer)
+            {
+                stagger.saturating_add(1)
+            } else {
+                stagger
+            };
+            self.hit_with_technique(
+                index,
+                technique,
+                bonus,
+                stagger,
+                fixed_damage,
+                dx,
+                dy,
+                visual,
+            );
             if self.monsters[index].alive
                 && matches!(technique, TechniqueKind::Kick | TechniqueKind::Earthbreak)
             {
@@ -4164,6 +4926,7 @@ impl GameState {
         enough
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn hit_with_technique(
         &mut self,
         index: usize,
@@ -4171,6 +4934,8 @@ impl GameState {
         bonus: i32,
         stagger: u8,
         fixed_damage: Option<i32>,
+        dx: i32,
+        dy: i32,
         visual: &mut VisualState,
     ) {
         let interrupted = self.monsters[index].windup > 0;
@@ -4190,6 +4955,7 @@ impl GameState {
         }
         let monster = &mut self.monsters[index];
         monster.awakened = true;
+        monster.intent = None;
         monster.stats.hp -= damage;
         monster.staggered = monster.staggered.max(stagger);
         if interrupted {
@@ -4198,6 +4964,7 @@ impl GameState {
         }
         let (x, y) = (monster.x, monster.y);
         self.stats.dmg_dealt += damage;
+        visual.add_effect(VisualEffect::technique_impact(x, y, dx, dy, technique));
         visual.add_effect(VisualEffect::attack_flash(x, y));
         visual.add_effect(VisualEffect::damage_number(x, y, damage));
         if monster.stats.hp <= 0 {
@@ -4272,9 +5039,13 @@ impl GameState {
                 "Beyond the door: a faint scrape, then stillness."
             }
             Some(MonsterKind::Necromancer) => "Beyond the door: a low, measured whisper.",
-            Some(MonsterKind::Orc | MonsterKind::Guardian | MonsterKind::Sentinel) => {
-                "Beyond the door: something heavy shifts its weight."
-            }
+            Some(
+                MonsterKind::Orc
+                | MonsterKind::Guardian
+                | MonsterKind::Sentinel
+                | MonsterKind::Stalker,
+            ) => "Beyond the door: something heavy shifts its weight.",
+            Some(MonsterKind::BellWarden) => "Beyond the door: a bell is struck once, by hand.",
             Some(_) => "Beyond the door: quiet movement in the dark.",
             None => "Only the dungeon's breathing answers.",
         };
@@ -4465,6 +5236,33 @@ impl GameState {
                 visual.add_effect(VisualEffect::heal_glow(self.player.x, self.player.y));
                 self.end_turn(visual);
             }
+            PreparationMenu::Mastery(weapon) => {
+                let Some(&mastery) = WeaponMastery::options_for(Some(weapon))
+                    .get(usize::from(choice.saturating_sub(1)))
+                else {
+                    return;
+                };
+                if self.player.weapon != Some(weapon) {
+                    self.preparation_menu = None;
+                    self.msg(
+                        "The forge's lesson no longer fits your weapon.",
+                        MsgColor::DIM,
+                    );
+                    return;
+                }
+                self.player.weapon_mastery = Some(mastery);
+                self.preparation_menu = None;
+                self.pending_noise = Some(crate::floor::NoiseKind::Impact);
+                self.msg(
+                    format!(
+                        "You take the {} path: {}.",
+                        mastery.name(),
+                        mastery.description()
+                    ),
+                    MsgColor::LOOT,
+                );
+                self.end_turn(visual);
+            }
         }
     }
 
@@ -4508,6 +5306,45 @@ impl GameState {
                     false
                 } else {
                     self.player.inventory.push(ItemKind::Antidote);
+                    if let Some(room) = self.map.rooms.get(room_index).copied() {
+                        let (cx, cy) = room.center();
+                        let mut webbed = 0;
+                        for &(dx, dy) in &[(0, 0), (1, 0), (-1, 0), (0, 1), (0, -1)] {
+                            let (x, y) = (cx + dx, cy + dy);
+                            if self.map.in_bounds(x, y)
+                                && self.map.tiles[self.map.idx(x, y)] == Tile::Floor
+                            {
+                                let index = self.map.idx(x, y);
+                                self.map.tiles[index] = Tile::Web;
+                                webbed += 1;
+                            }
+                        }
+                        let spider_free = self.map.is_walkable(cx, cy)
+                            && (cx, cy) != (self.player.x, self.player.y)
+                            && !self
+                                .monsters
+                                .iter()
+                                .any(|monster| monster.alive && (monster.x, monster.y) == (cx, cy))
+                            && !self.npcs.iter().any(|npc| (npc.x, npc.y) == (cx, cy));
+                        if spider_free {
+                            let mut spider = Monster::new(cx, cy, MonsterKind::Spider);
+                            spider.awakened = true;
+                            self.monsters.push(spider);
+                        }
+                        if let Some(alert) = self.floor_memory.room_alert.get_mut(room_index) {
+                            *alert = (*alert).max(2);
+                        }
+                        self.pending_noise = Some(crate::floor::NoiseKind::Alarm);
+                        self.fov_dirty = FovDirty::MapChanged;
+                        self.msg(
+                            format!(
+                                "The nest wakes: {} web patch{} spread through the room.",
+                                webbed,
+                                if webbed == 1 { "" } else { "es" }
+                            ),
+                            MsgColor::DAMAGE_TAKEN,
+                        );
+                    }
                     self.msg(
                         "Beneath the webbing, you recover an antidote.",
                         MsgColor::LOOT,
@@ -4532,6 +5369,14 @@ impl GameState {
             }
             Landmark::BoneChapel => {
                 let levels = self.award_xp(10);
+                let quieted = self.floor_memory.attention.saturating_sub(20);
+                if quieted < self.floor_memory.attention {
+                    self.floor_memory.attention = quieted;
+                    self.msg(
+                        "The names on the wall make the floor forget you for a moment.",
+                        MsgColor::Cyan,
+                    );
+                }
                 self.msg(
                     if levels > 0 && self.rules_version >= 2 {
                         "The dead sharpen your purpose. You gain 10 XP and a discipline choice."
@@ -4553,6 +5398,7 @@ impl GameState {
                 };
                 if let Some(weapon) = upgraded {
                     self.player.weapon = Some(weapon);
+                    self.player.weapon_mastery = None;
                     if let Some(slot) = self
                         .player
                         .inventory
@@ -4574,6 +5420,15 @@ impl GameState {
                         }
                     }
                     self.msg("The hammer's ringing wakes the nearby dark.", MsgColor::DIM);
+                    self.used_landmarks.insert(room_index);
+                    if !WeaponMastery::options_for(Some(weapon)).is_empty() {
+                        self.preparation_menu = Some(PreparationMenu::Mastery(weapon));
+                        self.msg(
+                            "The forge leaves one last decision in your hands.",
+                            MsgColor::SYSTEM,
+                        );
+                        return true;
+                    }
                     true
                 } else {
                     self.msg(
@@ -4686,7 +5541,11 @@ fn quick_usable(kind: ItemKind) -> bool {
 fn telegraphs_heavy_attack(kind: MonsterKind) -> bool {
     matches!(
         kind,
-        MonsterKind::Orc | MonsterKind::Sentinel | MonsterKind::Guardian
+        MonsterKind::Orc
+            | MonsterKind::Sentinel
+            | MonsterKind::Guardian
+            | MonsterKind::Stalker
+            | MonsterKind::BellWarden
     )
 }
 
@@ -4697,6 +5556,7 @@ fn monster_attack_power(monster: &Monster, rules_version: u8) -> i32 {
                 && monster.kind == MonsterKind::Guardian
                 && monster.stats.hp * 2 <= monster.stats.max_hp,
         ) * 3
+        + i32::from(rules_version >= 3 && monster.kind == MonsterKind::BellWarden)
 }
 
 fn direction_index(dx: i32, dy: i32) -> i32 {
