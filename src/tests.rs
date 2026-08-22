@@ -1812,6 +1812,7 @@ mod game_state_tests {
     #[test]
     fn bump_attack_damages_monster() {
         let mut state = state_with_floor(10, 10);
+        state.rules_version = 3;
         let mx = state.player.x + 1;
         let my = state.player.y;
         let mut m = Monster::new(mx, my, MonsterKind::Rat);
@@ -1838,6 +1839,7 @@ mod game_state_tests {
     #[test]
     fn bump_attack_increments_damage_dealt() {
         let mut state = state_with_floor(10, 10);
+        state.rules_version = 3;
         let mx = state.player.x + 1;
         let my = state.player.y;
         let mut m = Monster::new(mx, my, MonsterKind::Rat);
@@ -1853,6 +1855,7 @@ mod game_state_tests {
     #[test]
     fn bump_attack_does_not_move_into_monster() {
         let mut state = state_with_floor(10, 10);
+        state.rules_version = 3;
         let mx = state.player.x + 1;
         let my = state.player.y;
         let mut m = Monster::new(mx, my, MonsterKind::Rat);
@@ -2490,6 +2493,7 @@ mod game_state_tests {
     #[test]
     fn loot_drop_lands_on_walkable_tile() {
         let mut state = state_with_floor(10, 10);
+        state.rules_version = 3;
         // Place monster with 1 HP so player can kill it
         let mx = state.player.x + 1;
         let my = state.player.y;
@@ -2513,6 +2517,7 @@ mod game_state_tests {
     #[test]
     fn loot_drop_does_not_overlap_existing_items() {
         let mut state = state_with_floor(10, 10);
+        state.rules_version = 3;
         // Place item near the monster spot
         state.items.push(Item::new(
             state.player.x + 1,
@@ -2616,6 +2621,7 @@ mod render_tests {
             preparation_menu: state.preparation_menu,
             hints_seen: 0,
             camera_angle: 0.0,
+            battle: None,
         }
     }
 
@@ -4074,6 +4080,7 @@ mod render_tests {
             preparation_menu: state.preparation_menu,
             hints_seen: 0,
             camera_angle: 0.0,
+            battle: None,
         };
 
         let backend = TestBackend::new(120, 60);
@@ -5871,6 +5878,7 @@ mod player_turn_tests {
     #[test]
     fn warhammer_pushes_a_surviving_target() {
         let (mut state, mut visual) = make_game_context();
+        state.rules_version = 3;
         state.player.weapon = Some(crate::entity::ItemKind::Warhammer);
         let monster = crate::entity::Monster::new(2, 3, crate::entity::MonsterKind::Orc);
         state.monsters.push(monster);
@@ -5898,6 +5906,7 @@ mod player_turn_tests {
     #[test]
     fn ordinary_weapon_breaks_at_zero_durability() {
         let (mut state, mut visual) = make_game_context();
+        state.rules_version = 3;
         state.player.weapon = Some(crate::entity::ItemKind::RustySword);
         state.player.weapon_durability = 1;
         state.monsters.push(crate::entity::Monster::new(
@@ -5915,6 +5924,7 @@ mod player_turn_tests {
     #[test]
     fn fragile_gear_wears_weapon_twice_per_attack() {
         let (mut state, mut visual) = make_game_context();
+        state.rules_version = 3;
         state.challenge_mode = crate::app::ChallengeMode::FragileGear;
         state.player.weapon = Some(crate::entity::ItemKind::RustySword);
         state.player.weapon_durability = 5;
@@ -6157,6 +6167,7 @@ mod player_turn_tests {
     #[test]
     fn move_into_monster_attacks_without_moving_player() {
         let (mut state, mut visual) = make_game_context();
+        state.rules_version = 3;
         let mon = crate::entity::Monster::new(2, 3, crate::entity::MonsterKind::Goblin);
         state.monsters.push(mon);
         let hp_before = state.monsters[0].stats.hp;
@@ -6285,6 +6296,7 @@ mod player_turn_tests {
     #[test]
     fn counterstrike_deals_bonus_damage_and_breaks_poise() {
         let (mut ordinary, mut ordinary_visual) = make_game_context();
+        ordinary.rules_version = 3;
         let mut target = crate::entity::Monster::new(2, 3, crate::entity::MonsterKind::Orc);
         target.stats.hp = 100;
         target.stats.max_hp = 100;
@@ -6293,6 +6305,7 @@ mod player_turn_tests {
         let ordinary_damage = 100 - ordinary.monsters[0].stats.hp;
 
         let (mut counter, mut counter_visual) = make_game_context();
+        counter.rules_version = 3;
         counter.player.counter_turns = 1;
         counter.monsters.push(target);
         counter.process_turn(Action::Move(1, 0), &mut counter_visual);
@@ -6310,6 +6323,7 @@ mod player_turn_tests {
     #[test]
     fn attacking_during_a_heavy_windup_interrupts_it() {
         let (mut state, mut visual) = make_game_context();
+        state.rules_version = 3;
         let mut orc = crate::entity::Monster::new(2, 3, crate::entity::MonsterKind::Orc);
         orc.stats.hp = 100;
         orc.stats.max_hp = 100;
@@ -6330,6 +6344,7 @@ mod player_turn_tests {
     #[test]
     fn guardian_crossing_half_health_unseals_crown_fire() {
         let (mut state, mut visual) = make_game_context();
+        state.rules_version = 3;
         let mut guardian = crate::entity::Monster::new(2, 3, crate::entity::MonsterKind::Guardian);
         guardian.stats.hp = guardian.stats.max_hp / 2 + 1;
         state.monsters.push(guardian);
@@ -6439,6 +6454,7 @@ mod player_turn_tests {
     #[test]
     fn rules_v2_level_up_queues_choice_instead_of_auto_stats() {
         let (mut state, mut visual) = make_game_context();
+        state.rules_version = 3;
         let mut rat = crate::entity::Monster::new(2, 3, crate::entity::MonsterKind::Rat);
         rat.stats.hp = 1;
         let reward = rat.kind.xp_value();
@@ -6459,6 +6475,7 @@ mod player_turn_tests {
     #[test]
     fn finesse_and_resolve_build_resources_and_counter_damage() {
         let (mut ordinary, mut ordinary_visual) = make_game_context();
+        ordinary.rules_version = 3;
         ordinary.player.counter_turns = 1;
         let mut target = crate::entity::Monster::new(2, 3, crate::entity::MonsterKind::Orc);
         target.stats.hp = 100;
@@ -6468,6 +6485,7 @@ mod player_turn_tests {
         let ordinary_damage = 100 - ordinary.monsters[0].stats.hp;
 
         let (mut built, mut built_visual) = make_game_context();
+        built.rules_version = 3;
         built.player.pending_level_ups = 2;
         built.resolve_discipline_choice(crate::entity::Discipline::Finesse);
         let base_max_stamina = crate::entity::MAX_STAMINA;
@@ -6817,5 +6835,581 @@ mod player_turn_tests {
         assert_eq!(state.player.gold, 20);
         assert!(state.used_landmarks.contains(&0));
         assert_eq!(save.used_landmarks, vec![0]);
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// OVERHAUL REGRESSION / INTEGRATION TESTS
+//
+// The v16 overhaul introduces instanced group battles with Fight / Technique /
+// Item / Guard / Flee commands, speed-ordered turns (player wins ties), a four-
+// hostile group cap, overworld turn freezing during a battle, and a deterministic
+// flee. It bumps the world save to v16 and the replay format to v2, so v15 saves
+// and v1 replays are rejected.
+//
+// Status of this working tree:
+//   * Save v16 / replay v2 boundaries: IMPLEMENTED. The version tests below run now.
+//   * Speed ordering + group cap 4 + overworld freeze + deterministic flee: wired
+//     onto `GameState` and the canonical `crate::battle` public API. The live tests
+//     in `overhaul_battle_speed_tests` and `overhaul_battle_integration` exercise
+//     that contract directly.
+// ══════════════════════════════════════════════════════════════════════════════
+
+mod overhaul_version_boundary_tests {
+    use super::*;
+    use crate::app::{ChallengeMode, GameMode};
+    use crate::replay::ReplayData;
+    use crate::replay::REPLAY_FORMAT_VERSION;
+    use crate::save::SaveData;
+    use crate::save::SAVE_VERSION;
+
+    fn fresh_save() -> SaveData {
+        let mut state = GameState::new(42);
+        state.new_game();
+        SaveData::from_state(&state)
+    }
+
+    fn fresh_replay() -> ReplayData {
+        ReplayData::with_modes(
+            42,
+            GameMode::Classic,
+            ChallengeMode::Standard,
+            crate::app::CURRENT_RULES_VERSION,
+        )
+    }
+
+    #[test]
+    fn current_world_save_validates() {
+        assert!(fresh_save().validate().is_ok());
+    }
+
+    #[test]
+    fn prior_world_save_is_rejected() {
+        // A save one format behind the build must be rejected rather than
+        // silently remapped. With SAVE_VERSION now 16 this exercises the v15
+        // rejection requirement.
+        let mut save = fresh_save();
+        save.version = SAVE_VERSION - 1;
+        let err = save
+            .validate()
+            .expect_err("prior world format must be rejected");
+        assert!(
+            err.contains("older world format") || err.contains("start a new run"),
+            "unexpected rejection message: {err}"
+        );
+    }
+
+    #[test]
+    fn v15_world_save_is_rejected_after_v16_bump() {
+        // Explicit coverage for the requested v15 boundary. Active now that
+        // SAVE_VERSION is 16; a no-op on any other version.
+        if SAVE_VERSION == 16 {
+            let mut save = fresh_save();
+            save.version = 15;
+            let err = save
+                .validate()
+                .expect_err("v15 world saves must be rejected");
+            assert!(
+                err.contains("older world format") || err.contains("start a new run"),
+                "unexpected rejection message: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn current_replay_format_validates() {
+        assert!(fresh_replay().validate().is_ok());
+    }
+
+    #[test]
+    fn prior_replay_format_is_rejected() {
+        // A replay one format behind must be rejected. With REPLAY_FORMAT_VERSION
+        // now 2 this exercises the v1 rejection requirement.
+        let mut replay = fresh_replay();
+        replay.format_version = REPLAY_FORMAT_VERSION - 1;
+        let err = replay
+            .validate()
+            .expect_err("prior replay format must be rejected");
+        assert!(
+            err.contains("older world format") || err.contains("start a new run"),
+            "unexpected rejection message: {err}"
+        );
+    }
+
+    #[test]
+    fn v1_replay_is_rejected_after_v2_bump() {
+        // Explicit coverage for the requested v1 boundary. Active now that
+        // REPLAY_FORMAT_VERSION is 2; a no-op on any other version.
+        if REPLAY_FORMAT_VERSION == 2 {
+            let mut replay = fresh_replay();
+            replay.format_version = 1;
+            let err = replay.validate().expect_err("v1 replays must be rejected");
+            assert!(
+                err.contains("older world format") || err.contains("start a new run"),
+                "unexpected rejection message: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn world_save_and_replay_format_are_v16_and_v2() {
+        // The v16 overhaul bumps the world save to v16 and the replay format to v2;
+        // this pins the contract the rejection tests above rely on.
+        assert_eq!(SAVE_VERSION, 16);
+        assert_eq!(REPLAY_FORMAT_VERSION, 2);
+    }
+}
+
+// Speed ordering ("speed tie favors player") is exercised live against the
+// canonical `crate::battle` public API introduced by the v16 overhaul.
+mod overhaul_battle_speed_tests {
+    use crate::battle::{initiative_order, CombatSpeed, Combatant};
+    use crate::entity::{Discipline, MonsterKind, Player};
+
+    #[test]
+    fn speed_tie_favors_player() {
+        // A player and an enemy with identical speed: the player acts first.
+        let order = initiative_order(10, &[(0, 10)]);
+        assert_eq!(order[0], Combatant::Player);
+        assert_eq!(order[1], Combatant::Enemy(0));
+    }
+
+    #[test]
+    fn faster_enemy_leads_but_player_wins_any_tie() {
+        // Bat (14) leads; the player (10) beats the Goblin (9); ties go to player.
+        let order = initiative_order(
+            10,
+            &[
+                (0, MonsterKind::Bat.speed()),
+                (1, MonsterKind::Goblin.speed()),
+            ],
+        );
+        assert_eq!(order[0], Combatant::Enemy(0)); // Bat
+        assert_eq!(order[1], Combatant::Player); // player before Goblin
+        assert_eq!(order[2], Combatant::Enemy(1)); // Goblin
+    }
+
+    #[test]
+    fn player_speed_is_base_ten_and_finesse_raises_it() {
+        let mut player = Player::new(0, 0);
+        assert_eq!(player.speed(), crate::battle::BASE_PLAYER_SPEED);
+        player.apply_discipline(Discipline::Finesse);
+        player.apply_discipline(Discipline::Finesse);
+        assert_eq!(player.speed(), crate::battle::BASE_PLAYER_SPEED + 2);
+    }
+
+    #[test]
+    fn equal_speed_enemies_keep_stable_index_order() {
+        // With the player faster, two equal-speed Rats resolve by world index.
+        let order = initiative_order(
+            20,
+            &[(7, MonsterKind::Rat.speed()), (2, MonsterKind::Rat.speed())],
+        );
+        assert_eq!(order[0], Combatant::Player); // player leads
+        assert_eq!(order[1], Combatant::Enemy(2)); // lower index first
+        assert_eq!(order[2], Combatant::Enemy(7));
+    }
+}
+
+// Group cap 4, overworld freezing, and deterministic flee are exercised live
+// against the canonical `GameState` battle API introduced by the v16 overhaul:
+// `in_battle`, `battle`, `battle_move_cursor`, `battle_confirm`, `battle_cancel`,
+// and `battle_flee`, with `crate::battle::BattleState` describing participants.
+mod overhaul_battle_integration {
+    use super::*;
+    use crate::battle::BattlePhase;
+
+    /// Build a flat, monster-free floor so bump-to-battle triggering is deterministic.
+    fn battle_ready_state() -> GameState {
+        let mut state = GameState::new(7);
+        state.new_game();
+        state.rules_version = 4;
+        state.status = GameStatus::Playing;
+        state.monsters.clear();
+        let (px, py) = (state.player.x, state.player.y);
+        for dy in -2..=2i32 {
+            for dx in -2..=2i32 {
+                let (x, y) = (px + dx, py + dy);
+                if state.map.in_bounds(x, y) {
+                    let tile_idx = state.map.idx(x, y);
+                    state.map.tiles[tile_idx] = Tile::Floor;
+                }
+            }
+        }
+        state
+    }
+
+    fn awake_hostile(state: &mut GameState, x: i32, y: i32) {
+        let mut m = crate::entity::Monster::new(x, y, crate::entity::MonsterKind::Goblin);
+        m.awakened = true;
+        state.monsters.push(m);
+    }
+
+    /// Bump the hostile one step east of the player to begin an instanced battle.
+    fn begin_battle(state: &mut GameState, visual: &mut VisualState) {
+        state.process_turn(crate::input::Action::Move(1, 0), visual);
+    }
+
+    #[test]
+    fn group_encounter_caps_at_four_nearest_awake_hostiles() {
+        let mut state = battle_ready_state();
+        let (px, py) = (state.player.x, state.player.y);
+        // Six awake hostiles within Chebyshev distance 2 of the bumped one.
+        awake_hostile(&mut state, px + 1, py);
+        awake_hostile(&mut state, px + 2, py);
+        awake_hostile(&mut state, px, py + 1);
+        awake_hostile(&mut state, px, py + 2);
+        awake_hostile(&mut state, px + 1, py + 1);
+        awake_hostile(&mut state, px + 2, py + 1);
+
+        let mut visual = VisualState::new(state.map.width, state.map.height);
+        begin_battle(&mut state, &mut visual);
+
+        assert!(state.in_battle(), "bumping a hostile starts a battle");
+        let battle = state.battle().expect("battle should be active");
+        assert_eq!(
+            battle.enemy_indices.len(),
+            4,
+            "group battle caps at four hostiles"
+        );
+        // Every participant is within reach of the player (nearest assembly).
+        for &idx in &battle.enemy_indices {
+            let cheb = (state.monsters[idx].x - px)
+                .abs()
+                .max((state.monsters[idx].y - py).abs());
+            assert!(cheb <= 2, "only the nearest hostiles join the battle");
+        }
+        assert_eq!(
+            state.monsters.len(),
+            6,
+            "extra hostiles remain in the overworld until the battle ends"
+        );
+    }
+
+    #[test]
+    fn active_battle_freezes_overworld_turns() {
+        let mut state = battle_ready_state();
+        let (px, py) = (state.player.x, state.player.y);
+        awake_hostile(&mut state, px + 1, py);
+        let mut visual = VisualState::new(state.map.width, state.map.height);
+        begin_battle(&mut state, &mut visual);
+
+        let turns_before = state.stats.turns;
+        let monster_x_before = state.monsters[0].x;
+        // An overworld move must not advance the overworld while a battle is instanced.
+        state.process_turn(crate::input::Action::Move(0, 1), &mut visual);
+
+        assert!(
+            state.in_battle(),
+            "the battle stays instanced after an overworld action"
+        );
+        assert_eq!(
+            state.stats.turns, turns_before,
+            "overworld turn must not advance during a battle"
+        );
+        assert_eq!(
+            state.monsters[0].x, monster_x_before,
+            "overworld monsters must not move during a battle"
+        );
+        assert_eq!(
+            state.player.y, py,
+            "player must not move in the overworld during a battle"
+        );
+    }
+
+    #[test]
+    fn flee_outcome_is_deterministic_for_identical_state() {
+        let setup = || {
+            let mut state = battle_ready_state();
+            let (px, py) = (state.player.x, state.player.y);
+            awake_hostile(&mut state, px + 1, py);
+            let mut visual = VisualState::new(state.map.width, state.map.height);
+            begin_battle(&mut state, &mut visual);
+            (state, visual)
+        };
+        let (mut state, mut visual) = setup();
+        state.battle_flee(&mut visual);
+        let first_in_battle = state.in_battle();
+
+        let (mut state2, mut visual2) = setup();
+        state2.battle_flee(&mut visual2);
+        let second_in_battle = state2.in_battle();
+
+        assert_eq!(
+            first_in_battle, second_in_battle,
+            "flee outcome must be deterministic for identical state"
+        );
+    }
+
+    #[test]
+    fn battle_fight_command_enters_target_then_resolves() {
+        let mut state = battle_ready_state();
+        let (px, py) = (state.player.x, state.player.y);
+        awake_hostile(&mut state, px + 1, py);
+        let mut visual = VisualState::new(state.map.width, state.map.height);
+        begin_battle(&mut state, &mut visual);
+
+        state.battle_move_cursor(0); // Fight
+        state.battle_confirm(&mut visual); // -> Target phase
+        assert_eq!(
+            state.battle().expect("battle active").phase,
+            BattlePhase::Target
+        );
+        state.battle_confirm(&mut visual); // resolve round against the selected target
+        match state.battle() {
+            Some(battle) => assert_eq!(battle.phase, BattlePhase::Input),
+            None => assert!(
+                !state.in_battle(),
+                "battle should end only if the target fell"
+            ),
+        }
+    }
+
+    #[test]
+    fn battle_guard_command_resolves_a_round() {
+        let mut state = battle_ready_state();
+        let (px, py) = (state.player.x, state.player.y);
+        awake_hostile(&mut state, px + 1, py);
+        let mut visual = VisualState::new(state.map.width, state.map.height);
+        begin_battle(&mut state, &mut visual);
+
+        state.battle_move_cursor(3); // Guard
+        state.battle_confirm(&mut visual);
+        // After a guard round the battle returns to command input for the next turn.
+        assert_eq!(
+            state.battle().expect("battle active").phase,
+            BattlePhase::Input
+        );
+    }
+
+    #[test]
+    fn battle_cancel_returns_to_command_selection() {
+        let mut state = battle_ready_state();
+        let (px, py) = (state.player.x, state.player.y);
+        awake_hostile(&mut state, px + 1, py);
+        let mut visual = VisualState::new(state.map.width, state.map.height);
+        begin_battle(&mut state, &mut visual);
+
+        state.battle_move_cursor(0); // Fight
+        state.battle_confirm(&mut visual); // -> Target phase
+        assert_eq!(
+            state.battle().expect("battle active").phase,
+            BattlePhase::Target
+        );
+        state.battle_cancel();
+        assert_eq!(
+            state.battle().expect("battle active").phase,
+            BattlePhase::Input
+        );
+    }
+
+    #[test]
+    fn player_wins_tie_in_full_battle_order() {
+        // High-level restatement of the speed-tie rule using the shared orderer.
+        let order = crate::battle::initiative_order(9, &[(0, 9)]);
+        assert_eq!(order[0], crate::battle::Combatant::Player);
+        assert_eq!(order[1], crate::battle::Combatant::Enemy(0));
+    }
+
+    /// Push `kind` at `(x, y)`, awake, as a battle participant candidate.
+    fn hostile(state: &mut GameState, kind: MonsterKind, x: i32, y: i32) -> usize {
+        let m = crate::entity::Monster::new(x, y, kind);
+        state.monsters.push(m);
+        state.monsters.len() - 1
+    }
+
+    #[test]
+    fn enemy_lethal_blow_sets_alive_false_and_skips_later_combatants() {
+        // Finding 1: a lethal enemy strike must flip `player.alive = false` and
+        // stop any combatant scheduled later in the same round.
+        let mut state = battle_ready_state();
+        state.player.finesse_rank = 0; // speed 10, slower than the bat (14)
+        state.player.stats.hp = 1;
+        state.player.stats.max_hp = 20;
+        let (px, py) = (state.player.x, state.player.y);
+        hostile(&mut state, MonsterKind::Bat, px + 1, py); // fastest, strikes first
+        let slime = hostile(&mut state, MonsterKind::Slime, px + 1, py + 1);
+        state.monsters[slime].awakened = true;
+        state.monsters[slime].windup = 5; // untouched iff the slime never acts
+        let mut visual = VisualState::new(state.map.width, state.map.height);
+        begin_battle(&mut state, &mut visual);
+        assert!(state.in_battle(), "bumping a hostile starts a battle");
+
+        // Fight -> target -> resolve. The bat kills the player before the slime's turn.
+        state.battle_move_cursor(0);
+        state.battle_confirm(&mut visual);
+        assert_eq!(
+            state.battle().expect("battle active").phase,
+            BattlePhase::Target
+        );
+        state.battle_confirm(&mut visual);
+
+        assert!(!state.player.alive, "lethal blow must set alive = false");
+        assert_eq!(state.player.stats.hp, 0, "hp clamps to 0 on death");
+        assert!(state.battle().is_none(), "battle ends when the player dies");
+        assert_eq!(state.status, GameStatus::Dead, "status flips to Dead");
+        // The slime was scheduled after the killing blow and must never have acted.
+        assert_eq!(
+            state.monsters[slime].windup, 5,
+            "a skipped later combatant did not take its turn"
+        );
+    }
+
+    #[test]
+    fn guard_only_protects_on_the_players_initiative_slot() {
+        // Finding 2: guard must engage on the player's own initiative slot, so a
+        // faster enemy still lands an unguarded hit. Conversely a slower enemy is
+        // guarded because it strikes after the player's slot.
+        // Faster enemy (bat, speed 14) strikes before the guard comes up.
+        let mut state = battle_ready_state();
+        let (px, py) = (state.player.x, state.player.y);
+        state.player.finesse_rank = 0; // speed 10
+        state.player.stats.hp = 80;
+        state.player.stats.max_hp = 80;
+        state.player.armor = None;
+        hostile(&mut state, MonsterKind::Bat, px + 1, py);
+        let mut visual = VisualState::new(state.map.width, state.map.height);
+        begin_battle(&mut state, &mut visual);
+        let hp_before = state.player.stats.hp;
+        state.battle_move_cursor(3); // Guard
+        state.battle_confirm(&mut visual); // -> Target
+        state.battle_confirm(&mut visual); // resolve round
+        assert!(
+            state.player.stats.hp < hp_before,
+            "the faster enemy must still land a hit"
+        );
+        assert_eq!(
+            state.stats.damage_guarded, 0,
+            "a faster enemy is not protected by the player's guard"
+        );
+
+        // Slower enemy (orc, speed 6) strikes after the player's slot.
+        let mut state2 = battle_ready_state();
+        let (px, py) = (state2.player.x, state2.player.y);
+        state2.player.finesse_rank = 0;
+        state2.player.stats.hp = 80;
+        state2.player.stats.max_hp = 80;
+        state2.player.armor = None;
+        hostile(&mut state2, MonsterKind::Orc, px + 1, py);
+        let mut visual2 = VisualState::new(state2.map.width, state2.map.height);
+        begin_battle(&mut state2, &mut visual2);
+        state2.battle_move_cursor(3); // Guard
+        state2.battle_confirm(&mut visual2); // -> Target
+        state2.battle_confirm(&mut visual2); // resolve round
+        assert!(
+            state2.stats.damage_guarded > 0,
+            "a slower enemy is reduced by the player's guard"
+        );
+    }
+
+    #[test]
+    fn technique_spends_stamina_and_hits_multiple_targets() {
+        // Finding 3: the equipped technique is really realized — it spends its
+        // stamina cost and strikes every target the technique's spread allows.
+        let mut state = battle_ready_state();
+        state.player.finesse_rank = 0;
+        state.player.weapon = Some(ItemKind::Longsword); // -> Sweep (cost 3, spread 3)
+        state.player.stamina = 10;
+        let (px, py) = (state.player.x, state.player.y);
+        // Primary (bumped) plus two more awake participants within reach.
+        let rat = hostile(&mut state, MonsterKind::Rat, px + 1, py);
+        let slime = hostile(&mut state, MonsterKind::Slime, px + 1, py + 1);
+        let goblin = hostile(&mut state, MonsterKind::Goblin, px, py + 1);
+        for &i in &[rat, slime, goblin] {
+            state.monsters[i].awakened = true;
+        }
+        let before: Vec<i32> = [rat, slime, goblin]
+            .iter()
+            .map(|&i| state.monsters[i].stats.hp)
+            .collect();
+        let mut visual = VisualState::new(state.map.width, state.map.height);
+        begin_battle(&mut state, &mut visual);
+
+        state.battle_move_cursor(1); // Technique
+        state.battle_confirm(&mut visual); // -> Target
+        assert_eq!(
+            state.battle().expect("battle active").phase,
+            BattlePhase::Target
+        );
+        state.battle_confirm(&mut visual); // resolve: Sweep hits all three
+
+        assert_eq!(
+            state.player.stamina, 7,
+            "technique spends its real stamina cost"
+        );
+        assert_eq!(state.stats.techniques_used, 1, "technique use is counted");
+        for (&i, &pre) in [rat, slime, goblin].iter().zip(before.iter()) {
+            assert!(
+                state.monsters[i].stats.hp < pre,
+                "every target in the sweep took damage"
+            );
+        }
+    }
+
+    #[test]
+    fn non_potion_consumable_is_selected_and_applied() {
+        // Finding 4: the battle item menu offers real consumables and applies
+        // their genuine effect (no faked substitute).
+        let mut state = battle_ready_state();
+        state.player.finesse_rank = 0;
+        state.player.stats.hp = 80;
+        state.player.stats.max_hp = 80;
+        state.player.inventory.push(ItemKind::ScrollOfFire);
+        let (px, py) = (state.player.x, state.player.y);
+        let rat = hostile(&mut state, MonsterKind::Rat, px + 1, py);
+        let slime = hostile(&mut state, MonsterKind::Slime, px + 1, py + 1);
+        for &i in &[rat, slime] {
+            state.monsters[i].awakened = true;
+        }
+        let before: Vec<i32> = [rat, slime]
+            .iter()
+            .map(|&i| state.monsters[i].stats.hp)
+            .collect();
+        let mut visual = VisualState::new(state.map.width, state.map.height);
+        begin_battle(&mut state, &mut visual);
+
+        state.battle_move_cursor(2); // Item
+        state.battle_confirm(&mut visual); // -> Item menu (lists Scroll of Fire)
+        assert_eq!(
+            state.battle().expect("battle active").phase,
+            BattlePhase::Item
+        );
+        state.battle_confirm(&mut visual); // resolve: scroll erupts for 8 AoE
+
+        for (&i, &pre) in [rat, slime].iter().zip(before.iter()) {
+            assert_eq!(
+                state.monsters[i].stats.hp,
+                pre - 8,
+                "fire scroll deals its real 8 AoE damage"
+            );
+        }
+        assert!(
+            !state.player.inventory.contains(&ItemKind::ScrollOfFire),
+            "the consumed scroll leaves the inventory"
+        );
+        assert_eq!(state.stats.items_used, 1, "item use is counted");
+    }
+
+    #[test]
+    fn antidote_clears_poison_through_battle_item_menu() {
+        // Finding 4 (companion): an applicable battle consumable removes its
+        // condition instead of being silently faked.
+        let mut state = battle_ready_state();
+        state.player.finesse_rank = 0;
+        state.player.stats.hp = 80;
+        state.player.stats.max_hp = 80;
+        state.player.poisoned = true;
+        state.player.poison_ticks = 3;
+        state.player.inventory.push(ItemKind::Antidote);
+        let (px, py) = (state.player.x, state.player.y);
+        hostile(&mut state, MonsterKind::Goblin, px + 1, py);
+        let mut visual = VisualState::new(state.map.width, state.map.height);
+        begin_battle(&mut state, &mut visual);
+
+        state.battle_move_cursor(2); // Item
+        state.battle_confirm(&mut visual); // -> Item menu
+        state.battle_confirm(&mut visual); // resolve: antidote applied
+
+        assert!(!state.player.poisoned, "antidote clears poison in battle");
     }
 }

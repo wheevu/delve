@@ -25,6 +25,15 @@ pub enum Action {
     ToggleDoor(i32, i32),   // open or close the facing door
     Listen(i32, i32),       // listen through the facing closed door
     Disarm(i32, i32),       // disarm a revealed trap underfoot or ahead
+
+    // ── Instanced battle input (rules_version >= 4) ──
+    /// Move the battle cursor (−1 / +1) within the current phase (command menu,
+    /// target picker, or item picker).
+    BattleMove(isize),
+    /// Confirm the current battle selection (command, target, or item).
+    BattleConfirm,
+    /// Step back from target/item selection to the command menu.
+    BattleCancel,
 }
 
 /// Actions available inside the inventory screen.

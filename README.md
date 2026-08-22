@@ -40,8 +40,10 @@ dialogue. Doors, shallow water, webs, lanterns, and local firelight keep terrain
 and light readable rather than decorative.
 
 The world layer is a fresh-save boundary. Start a new run to see the new route
-and keep older saves as archives; the loader rejects pre-v15 world saves instead
-of silently remapping their floor data.
+and keep older saves as archives; the loader rejects pre-v16 world saves instead
+of silently remapping their floor data. Combat now resolves in instanced group
+battles: engaging a cluster of nearby awake hostiles pulls the fight into its own
+battle and freezes the rest of the floor until it ends.
 
 ## More from the current build
 
@@ -131,6 +133,29 @@ small 30 FPS tick: it eases actors between cells and telegraphs attacks, but it
 does not change collision, procedural generation, saves, or replay outcomes. F2
 reduces flashes and F8 enables the low-motion presentation mode.
 
+## Battles
+
+Most fights open as instanced group battles.
+When you engage a cluster of nearby awake hostiles, Delve pulls the fight into its own battle and freezes the rest of the floor until it ends.
+No overworld turns pass and monsters elsewhere hold still, so the encounter resolves on its own clock.
+
+Inside a battle you act through five commands:
+
+- **Fight** — a basic weapon attack against the chosen target.
+- **Technique** — your loadout technique (Kick, Shield Bash, Lunge, Sweep, Earthbreak, or Cinder Arc), at its stamina or wind-up cost.
+- **Item** — use a consumable from your pack mid-battle.
+- **Guard** — brace in place for reduced incoming damage and a defensive stance for the round.
+- **Flee** — attempt to leave the battle.
+
+Fleeing is deterministic.
+It either exits cleanly back to the overworld or fails outright, with no partial or random escape.
+
+Actors take their turns in speed order.
+On a speed tie the player acts first, so equal-speed hostiles never steal the player's opening move.
+
+The enemy group is capped at four hostiles per battle.
+The nearest awake threats are pulled in first, and any extra hostiles stay in the overworld until the battle ends.
+
 ## Controls
 
 You can play the whole game from the keyboard. Press `?` in-game for the complete
@@ -158,6 +183,11 @@ reference; these are the keys you will use most:
 | Quick-use setup / use | `Q` in the inventory, then `f` |
 | Presentation settings | `F2` flash · `F3` contrast · `F4` camera · `F6` head movement · `F7` palette · `F8` low motion |
 | Save / load / quit | `F5` · `F9` · `q` |
+
+In a battle, use `W`/`S` or the arrow keys to choose a command, then `Enter` or `Space` to confirm.
+Choose a target for Fight, Technique, or Item, and press `Esc` to return to the command list.
+Fleeing is deterministic: it exits cleanly or fails outright.
+Speed decides who acts first, and a tie goes to you.
 
 From the main menu, `x` cycles optional challenges: no minimap, reduced sight,
 double weapon wear, and relentless mobile monsters. Presentation choices live in
@@ -201,10 +231,12 @@ check a balance change, or share a strange moment from the dungeon without
 opening the TUI first. Replays carry their rules version, so older recorded runs
 keep their original generation and combat branches.
 
-The current save format is version 15 and local to `delve_save.json`. It persists
+The current save format is version 16 and local to `delve_save.json`. It persists
 the map's world theme, surfaces, and environmental props, rejects older world
-formats with a fresh-run message, and rejects newer formats rather than guessing
-at their layout. Replays use world format 1 and follow the same explicit boundary.
+formats (including v15) with a fresh-run message, and rejects newer formats
+rather than guessing at their layout. Replays use world format 2 and follow the
+same explicit boundary; v1 replays are rejected and must be re-recorded from a
+new run.
 
 Press `?` in-game for the full rules reference.
 Run `delve --help` for the current command reference.

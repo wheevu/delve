@@ -10,7 +10,10 @@ use crate::map::Map;
 use crate::ui;
 
 /// Save format containing the medieval world layout and map contract.
-pub(crate) const SAVE_VERSION: u32 = 15;
+///
+/// Bumped 15 → 16 for the combat overhaul (rules‑v4 boundary). Older saves
+/// (format ≤ 15) keep their historical rules era via `rules_version_for_save`.
+pub(crate) const SAVE_VERSION: u32 = 16;
 pub(crate) const SAVE_PATH: &str = "delve_save.json";
 const MAX_MAP_PROPS: usize = 4_096;
 
@@ -19,7 +22,9 @@ pub(crate) const fn rules_version_for_save(version: u32) -> u8 {
         0..=10 => 0,
         11 => 1,
         12..=13 => 2,
-        _ => 3,
+        14..=15 => 3,
+        16 => 4,
+        _ => 4,
     }
 }
 
@@ -519,5 +524,36 @@ mod tests {
             .validate()
             .expect_err("invalid prop metadata must fail");
         assert!(error.contains("environment prop 0 out of bounds"));
+    }
+
+    #[test]
+    fn save_format_version_is_sixteen_for_the_combat_overhaul() {
+        assert_eq!(SAVE_VERSION, 16);
+    }
+
+    #[test]
+    fn save_versions_map_to_preserved_rule_eras_including_v16() {
+        // Legacy eras must not shift when the v16/rules‑v4 boundary is added.
+        assert_eq!(rules_version_for_save(10), 0);
+        assert_eq!(rules_version_for_save(11), 1);
+        assert_eq!(rules_version_for_save(12), 2);
+        assert_eq!(rules_version_for_save(13), 2);
+        // v14/v15 were the rules‑v3 era; v16 opens the combat‑overhaul era.
+        assert_eq!(rules_version_for_save(14), 3);
+        assert_eq!(rules_version_for_save(15), 3);
+        assert_eq!(rules_version_for_save(16), 4);
+    }
+
+    #[test]
+    fn newer_world_saves_are_rejected_with_a_clear_message() {
+        let mut state = GameState::new(42);
+        state.new_game();
+        let mut save = SaveData::from_state(&state);
+        save.version = SAVE_VERSION + 1;
+
+        let error = save
+            .validate()
+            .expect_err("future world saves must be rejected");
+        assert!(error.contains("newer than this build"));
     }
 }

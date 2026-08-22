@@ -213,6 +213,105 @@ impl HalfBlockCanvas {
         }
     }
 
+    /// Screen-blend an RGB color onto a single signed-coordinate pixel.
+    ///
+    /// Cheap luminous primitive: brightens a pixel toward `add` without ever
+    /// clipping to flat white, because screen blending saturates gently. Used
+    /// by `glow` and `bloom` to build the painterly pass.
+    pub fn screen_blend_pixel(&mut self, x: i32, py: i32, add: (u8, u8, u8), amount: f32) {
+        if x < 0 || py < 0 || x >= self.width as i32 || py >= self.pixel_height() as i32 {
+            return;
+        }
+        let pixel = &mut self.pixels[x as usize + py as usize * self.width];
+        let (r, g, b) = match *pixel {
+            Color::Rgb(r, g, b) => (r, g, b),
+            Color::Black => (0, 0, 0),
+            _ => return,
+        };
+        let (r2, g2, b2) = visual::screen_blend((r, g, b), add, amount);
+        *pixel = Color::Rgb(r2, g2, b2);
+    }
+
+    /// Additive radial glow built from `screen_blend_pixel`.
+    ///
+    /// One pass over the glow's bounding box; pixels outside the radius are
+    /// skipped, and the core fades with a smoothstep so the halo reads as
+    /// painted light rather than a hard disc. `amount` is the peak strength at
+    /// the center.
+    pub fn glow(&mut self, cx: i32, cy: i32, radius: f32, color: (u8, u8, u8), amount: f32) {
+        if radius <= 0.0 || amount <= 0.0 {
+            return;
+        }
+        let r = radius.ceil() as i32;
+        let x0 = (cx - r).max(0);
+        let x1 = (cx + r).min(self.width as i32 - 1);
+        let y0 = (cy - r).max(0);
+        let y1 = (cy + r).min(self.pixel_height() as i32 - 1);
+        for py in y0..=y1 {
+            for px in x0..=x1 {
+                let dx = px - cx;
+                let dy = py - cy;
+                let dist = (dx * dx + dy * dy) as f32;
+                let t = (1.0 - (dist.sqrt() / radius)).clamp(0.0, 1.0);
+                if t <= 0.0 {
+                    continue;
+                }
+                let falloff = t * t * (3.0 - 2.0 * t);
+                self.screen_blend_pixel(px, py, color, amount * falloff);
+            }
+        }
+    }
+
+    /// Cheap single-pass bloom.
+    ///
+    /// Bright pixels (luminance above `threshold`) are lifted and bled a little
+    /// into their neighbours with a screen blend, so highlights gain a soft
+    /// luminous halo. Seeds are gathered first so the pass never feeds its own
+    /// output back in, keeping it stable and order-independent. `strength`
+    /// scales how far the halo reaches.
+    pub fn bloom(&mut self, threshold: f32, strength: f32) {
+        let threshold = threshold.clamp(0.0, 1.0);
+        let strength = strength.clamp(0.0, 1.0);
+        if strength <= 0.0 {
+            return;
+        }
+        let width = self.width;
+        let ph = self.pixel_height();
+        let mut seeds: Vec<(usize, (u8, u8, u8), f32)> = Vec::new();
+        for py in 0..ph {
+            for px in 0..width {
+                let idx = px + py * width;
+                let Color::Rgb(r, g, b) = self.pixels[idx] else {
+                    continue;
+                };
+                let lum = luminance((r, g, b)) / 255.0;
+                if lum > threshold {
+                    let w = (lum - threshold) / (1.0 - threshold).max(0.001);
+                    seeds.push((idx, (r, g, b), w));
+                }
+            }
+        }
+        for (idx, color, w) in seeds {
+            let px = (idx % width) as i32;
+            let py = (idx / width) as i32;
+            let core = strength * w * 0.5;
+            for (ox, oy) in [
+                (0, 0),
+                (1, 0),
+                (-1, 0),
+                (0, 1),
+                (0, -1),
+                (2, 0),
+                (-2, 0),
+                (0, 2),
+                (0, -2),
+            ] {
+                let a = if ox == 0 && oy == 0 { core } else { core * 0.5 };
+                self.screen_blend_pixel(px + ox, py + oy, color, a);
+            }
+        }
+    }
+
     #[allow(dead_code)]
     pub fn tint_rect(
         &mut self,
@@ -366,6 +465,11 @@ impl HalfBlockCanvas {
             }
         }
     }
+}
+
+/// Perceptual luminance of an RGB triple in 0..=255.
+fn luminance(c: (u8, u8, u8)) -> f32 {
+    0.2126 * c.0 as f32 + 0.7152 * c.1 as f32 + 0.0722 * c.2 as f32
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -1133,5 +1237,68 @@ mod tests {
         let mut tiny = HalfBlockCanvas::new(1, 1);
         draw_menu_scene(&mut tiny, 24, 0, false, false);
         assert_eq!(tiny.pixels.len(), 2);
+    }
+
+    #[test]
+    fn screen_blend_pixel_brightens_without_clipping_flat_white() {
+        let mut canvas = HalfBlockCanvas::new(3, 2);
+        canvas.set_pixel(0, 0, Color::Rgb(40, 40, 40));
+        // A strong add should lift the pixel but not slam it to 255.
+        canvas.screen_blend_pixel(0, 0, (255, 255, 255), 0.5);
+        let Color::Rgb(r, g, b) = canvas.pixels[0] else {
+            panic!("expected rgb pixel");
+        };
+        assert!(r > 40 && g > 40 && b > 40, "should brighten");
+        assert!((r, g, b) != (255, 255, 255), "screen blend must not clip");
+    }
+
+    #[test]
+    fn glow_lifts_center_and_leaves_distant_corner_untouched() {
+        let mut canvas = HalfBlockCanvas::new(11, 6);
+        canvas.fill(Color::Rgb(10, 10, 10));
+        let center = (5, 5); // py=5 is the bottom half-block pixel of cell_y=2
+        canvas.glow(5, 5, 3.0, (200, 200, 200), 0.6);
+        let lit = match canvas.pixels[5 + center.1 as usize * 11] {
+            Color::Rgb(r, _, _) => r,
+            _ => 0,
+        };
+        assert!(lit > 10, "center should glow");
+        // Far corner is well outside the radius and must stay at the base fill.
+        let corner = match canvas.pixels[0] {
+            Color::Rgb(r, _, _) => r,
+            _ => 255,
+        };
+        assert_eq!(corner, 10, "outside radius must be untouched");
+    }
+
+    #[test]
+    fn bloom_lifts_bright_pixels_and_bleeds_to_neighbours() {
+        let mut canvas = HalfBlockCanvas::new(5, 4);
+        canvas.fill(Color::Rgb(5, 5, 5));
+        // One bright seed in the middle.
+        canvas.set_pixel(2, 2, Color::Rgb(250, 250, 250));
+        canvas.bloom(0.6, 0.5);
+        let seed = match canvas.pixels[2 + 2 * 5] {
+            Color::Rgb(r, _, _) => r,
+            _ => 0,
+        };
+        assert!(seed >= 250, "bright seed stays bright");
+        // A direct orthogonal neighbour should have lifted off the 5 base.
+        let neighbour = match canvas.pixels[2 + 5] {
+            Color::Rgb(r, _, _) => r,
+            _ => 0,
+        };
+        assert!(neighbour > 5, "bloom should bleed into neighbours");
+    }
+
+    #[test]
+    fn luminous_primitives_noop_on_tiny_canvas() {
+        let mut canvas = HalfBlockCanvas::new(1, 1);
+        // Should not panic even when the glow/bloom bounds collapse.
+        canvas.glow(0, 0, 0.0, (200, 200, 200), 0.5);
+        canvas.glow(0, 0, 2.0, (200, 200, 200), 0.5);
+        canvas.bloom(0.0, 0.0);
+        canvas.screen_blend_pixel(-1, -1, (10, 10, 10), 1.0);
+        assert_eq!(canvas.pixels.len(), 2);
     }
 }

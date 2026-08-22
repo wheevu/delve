@@ -284,6 +284,7 @@ pub(crate) fn render_viewport(frame: &mut Frame<'_>, area: Rect, ctx: &RenderCtx
     draw_ambient_motes(&mut canvas, ctx, horizon, quality, true);
     draw_player_foreground(&mut canvas, ctx);
     draw_screen_effects(&mut canvas, ctx);
+    apply_luminous_pass(&mut canvas, ctx, &wall_depth, quality, horizon);
 
     canvas.vignette(0.32);
     if ctx.high_contrast {
@@ -4524,6 +4525,88 @@ fn draw_weapon_stroke(
         color(shadow),
     );
     canvas.line(start_x, start_y, end_x, end_y, color(face));
+}
+
+/// Painterly/luminous post pass over the half-block viewport.
+///
+/// Three cheap layers, all gated by the accessibility flags:
+///   1. Depth-haze — a luminous fog tint keyed off the wall depth buffer
+///      (walls use the exact per-column distance; floor/ceiling reuse the same
+///      projection the raycaster used). Skipped under `high_contrast`.
+///   2. Glow — a soft radial halo behind the player foreground, the visible
+///      face of the `glow` primitive. Reduced under `reduced_flash`.
+///   3. Bloom — a single-pass `bloom` over bright pixels; weakened under
+///      `high_contrast` and `reduced_flash`.
+///
+/// The pass is inherently static, so `low_motion` needs no special handling.
+fn apply_luminous_pass(
+    canvas: &mut HalfBlockCanvas,
+    ctx: &RenderCtx<'_>,
+    wall_depth: &[f64],
+    quality: RenderQuality,
+    horizon: i32,
+) {
+    let width = canvas.width() as i32;
+    let height = canvas.pixel_height() as i32;
+    if width < 8 || height < 8 {
+        return;
+    }
+    let palette = medieval_palette(
+        ctx,
+        visual::world_palette(ctx.color_filter, Biome::from(ctx.player.depth)),
+    );
+    let haze = visual::lerp(palette.fog, palette.light, 0.22);
+
+    // ── 1. Depth-haze layer ──
+    if !ctx.high_contrast {
+        let projection = height as f64 * 0.38;
+        for px in 0..width {
+            let wall_d = wall_depth
+                .get(px as usize)
+                .copied()
+                .unwrap_or(MAX_VIEW_DEPTH);
+            for py in 0..height {
+                let row_depth = if (py - horizon).abs() < 1 {
+                    wall_d
+                } else {
+                    projection / (py - horizon).abs() as f64
+                };
+                let t = (row_depth / MAX_VIEW_DEPTH).clamp(0.0, 1.0);
+                let fog_t = (t * t * (3.0 - 2.0 * t)) as f32 * 0.16;
+                if fog_t <= 0.0 {
+                    continue;
+                }
+                canvas.screen_blend_pixel(px, py, haze, fog_t);
+            }
+        }
+    }
+
+    // ── 2. Soft glow behind the player foreground ──
+    let base_glow = if ctx.reduced_flash { 0.05 } else { 0.10 };
+    let glow_amt = if quality.fine_detail {
+        base_glow
+    } else {
+        base_glow * 0.6
+    };
+    let cx = width / 2;
+    let cy = (height - 4).clamp(2, height - 2);
+    canvas.glow(
+        cx,
+        cy,
+        (width as f32 * 0.22).max(6.0),
+        palette.light,
+        glow_amt,
+    );
+
+    // ── 3. Bloom ──
+    let (threshold, strength) = if ctx.high_contrast {
+        (0.72, 0.06)
+    } else if ctx.reduced_flash {
+        (0.62, 0.10)
+    } else {
+        (0.58, 0.16)
+    };
+    canvas.bloom(threshold, strength);
 }
 
 fn draw_screen_effects(canvas: &mut HalfBlockCanvas, ctx: &RenderCtx<'_>) {

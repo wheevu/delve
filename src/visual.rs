@@ -781,6 +781,24 @@ pub fn lerp(a: Rgb, b: Rgb, t: f32) -> Rgb {
     )
 }
 
+/// Screen blend of `add` onto `base` by `amount` (0..=1).
+///
+/// Screen blending keeps highlights luminous: `out = 1 - (1 - base)(1 - add)`.
+/// `amount` interpolates between the original `base` and the fully screened
+/// result, so a small amount reads as a cheap additive glow without clipping.
+pub fn screen_blend(base: Rgb, add: Rgb, amount: f32) -> Rgb {
+    let amount = amount.clamp(0.0, 1.0);
+    let mix = |b: u8, a: u8| -> u8 {
+        let b = b as f32 / 255.0;
+        let a = a as f32 / 255.0;
+        let screened = 1.0 - (1.0 - b) * (1.0 - a);
+        ((b + (screened - b) * amount) * 255.0)
+            .round()
+            .clamp(0.0, 255.0) as u8
+    };
+    (mix(base.0, add.0), mix(base.1, add.1), mix(base.2, add.2))
+}
+
 impl Biome {
     pub fn floor_visible(&self) -> Rgb {
         match self {

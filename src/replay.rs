@@ -15,7 +15,14 @@ const MAX_REPLAY_ACTIONS: usize = 1_000_000;
 const MAX_REPLAY_MAP_PROPS: usize = 4_096;
 
 /// Replay schema containing the medieval world layout contract.
-pub(crate) const REPLAY_FORMAT_VERSION: u8 = 1;
+///
+/// Bumped 1 → 2 for the v16 combat overhaul (rules‑v4 boundary). Format 2
+/// records instanced battle actions through the same action log as the rest of
+/// play: `BattleMove` / `BattleConfirm` / `BattleCancel` flow through
+/// `GameState::process_turn`, so a replay that reached a battle reproduces it
+/// turn‑for‑turn without any extra battle‑specific metadata. Older files
+/// (format 0/1) are still rejected at validation with a clear message.
+pub(crate) const REPLAY_FORMAT_VERSION: u8 = 2;
 
 /// A single turn in the action log.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -45,9 +52,16 @@ pub enum ActionRepr {
     Listen(i32, i32),
     Disarm(i32, i32),
     UseItem(usize), // inventory slot
-    PreparationChoice { menu: PreparationMenu, choice: u8 },
+    PreparationChoice {
+        menu: PreparationMenu,
+        choice: u8,
+    },
     DisciplineChoice(Discipline),
     InteractEnvironment(i32, i32),
+    /// Battle menu navigation / selection while an instanced battle is active.
+    BattleMove(isize),
+    BattleConfirm,
+    BattleCancel,
     None,
 }
 
@@ -76,6 +90,9 @@ impl From<Action> for ActionRepr {
             Action::Inventory => ActionRepr::None, // handled separately
             Action::ConversationChoice(choice) => ActionRepr::ConversationChoice(choice),
             Action::QuestPanel => ActionRepr::None, // UI toggle only
+            Action::BattleMove(delta) => ActionRepr::BattleMove(delta),
+            Action::BattleConfirm => ActionRepr::BattleConfirm,
+            Action::BattleCancel => ActionRepr::BattleCancel,
         }
     }
 }
@@ -526,6 +543,9 @@ fn apply_action(
                 ActionRepr::ToggleDoor(dx, dy) => Action::ToggleDoor(dx, dy),
                 ActionRepr::Listen(dx, dy) => Action::Listen(dx, dy),
                 ActionRepr::Disarm(dx, dy) => Action::Disarm(dx, dy),
+                ActionRepr::BattleMove(delta) => Action::BattleMove(delta),
+                ActionRepr::BattleConfirm => Action::BattleConfirm,
+                ActionRepr::BattleCancel => Action::BattleCancel,
                 _ => unreachable!("non-gameplay replay actions handled above"),
             };
             state.process_turn(action, visual);
@@ -704,5 +724,198 @@ mod tests {
         assert_eq!(state.stats.turns, 0);
         assert_eq!(state.player.pending_level_ups, 0);
         assert_eq!(state.player.resolve_rank, 1);
+    }
+
+    #[test]
+    fn replay_format_version_is_two_for_the_combat_overhaul() {
+        assert_eq!(REPLAY_FORMAT_VERSION, 2);
+    }
+
+    #[test]
+    fn replay_v2_accepts_current_format_and_rejects_older_and_newer() {
+        let replay = ReplayData::with_modes(
+            42,
+            GameMode::Classic,
+            ChallengeMode::Standard,
+            crate::app::CURRENT_RULES_VERSION,
+        );
+        assert!(replay.validate().is_ok());
+
+        // Older world format (pre‑overhaul) must be rejected.
+        let mut older = replay.clone();
+        older.format_version = REPLAY_FORMAT_VERSION - 1;
+        let error = older
+            .validate()
+            .expect_err("old world replays must be rejected");
+        assert!(error.contains("older world format"));
+        assert!(error.contains("start a new run"));
+
+        // Newer world format must be rejected with a distinct message.
+        let mut newer = replay.clone();
+        newer.format_version = REPLAY_FORMAT_VERSION + 1;
+        let error = newer
+            .validate()
+            .expect_err("future world replays must be rejected");
+        assert!(error.contains("newer than this build"));
+    }
+
+    #[test]
+    fn legacy_v1_replay_json_is_rejected() {
+        // A replay recorded before the v16 combat overhaul (format 1) must be
+        // rejected so it cannot replay against the v2 world contract.
+        let json = r#"{"seed":42,"format_version":1,"actions":[]}"#;
+        let replay: ReplayData = serde_json::from_str(json).expect("v1 replay should deserialize");
+        let error = replay.validate().expect_err("v1 replays must be rejected");
+        assert!(error.contains("older world format"));
+        assert!(error.contains("start a new run"));
+    }
+
+    /// One BFS step toward the nearest alive monster. If the player is already
+    /// orthogonally adjacent to a monster, returns the bump direction. Returns
+    /// `None` when no monster is reachable over non-wall, non-locked-door tiles.
+    fn nav_step(state: &GameState) -> Option<(i32, i32)> {
+        let (px, py) = (state.player.x, state.player.y);
+        let w = state.map.width;
+        let h = state.map.height;
+        let start = state.map.idx(px, py);
+        let n = (w * h) as usize;
+        let mut visited = vec![false; n];
+        let mut parent: Vec<Option<usize>> = vec![None; n];
+        let mut queue = std::collections::VecDeque::new();
+        visited[start] = true;
+        queue.push_back(start);
+        let mut goal: Option<usize> = None;
+        let mut bump: Option<(i32, i32)> = None;
+        'outer: while let Some(cur) = queue.pop_front() {
+            let cx = (cur as i32) % w;
+            let cy = (cur as i32) / w;
+            for (dx, dy) in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
+                let nx = cx + dx;
+                let ny = cy + dy;
+                if !state.map.in_bounds(nx, ny) {
+                    continue;
+                }
+                if state
+                    .monsters
+                    .iter()
+                    .any(|m| m.alive && m.x == nx && m.y == ny)
+                {
+                    if cur == start {
+                        bump = Some((dx, dy));
+                    } else {
+                        goal = Some(cur);
+                    }
+                    break 'outer;
+                }
+            }
+            for (dx, dy) in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
+                let nx = cx + dx;
+                let ny = cy + dy;
+                if !state.map.in_bounds(nx, ny) {
+                    continue;
+                }
+                let ni = state.map.idx(nx, ny);
+                if visited[ni] {
+                    continue;
+                }
+                let t = state.map.tiles[ni];
+                if matches!(t, Tile::Wall | Tile::LockedDoor) {
+                    continue;
+                }
+                if state
+                    .monsters
+                    .iter()
+                    .any(|m| m.alive && m.x == nx && m.y == ny)
+                {
+                    continue;
+                }
+                visited[ni] = true;
+                parent[ni] = Some(cur);
+                queue.push_back(ni);
+            }
+        }
+        if let Some((dx, dy)) = bump {
+            return Some((dx, dy));
+        }
+        let gt = goal?;
+        // Reconstruct the path start -> ... -> gt and return the first step.
+        let mut node = gt;
+        let mut path = vec![gt];
+        while node != start {
+            node = parent[node].expect("path parent exists");
+            path.push(node);
+        }
+        path.reverse();
+        let first = path[1];
+        let fx = (first as i32) % w;
+        let fy = (first as i32) / w;
+        Some((fx - px, fy - py))
+    }
+
+    #[test]
+    fn replay_reproduces_an_instanced_battle_from_entry_to_outcome() {
+        // End-to-end: navigate the natural world to a hostile, drive the
+        // instanced battle from the bump that starts it through to a conclusion,
+        // then replay the recorded action log and assert the final state matches
+        // exactly. Every action (exploration move, bump, and battle command) is
+        // recorded through the same deterministic log, so a replay that reaches a
+        // battle reproduces it turn-for-turn without any custom monster state.
+        use crate::battle::BattlePhase;
+        use crate::entity::MonsterKind;
+
+        // A seed whose natural world places a reachable non-spider hostile with
+        // no spider nearby, so the battle stays RNG-trivial and the replay is a
+        // clean equality check.
+        let seed = 1u64;
+        let mut state = GameState::new(seed);
+        state.new_game_with_rules(4);
+        let mut visual = VisualState::new(state.map.width, state.map.height);
+
+        // Walk to the nearest hostile, recording every step.
+        let mut guard = 0;
+        while !state.in_battle() && guard < 200 {
+            guard += 1;
+            let dir = match nav_step(&state) {
+                Some(d) => d,
+                None => break,
+            };
+            state.process_turn(Action::Move(dir.0, dir.1), &mut visual);
+        }
+        assert!(state.in_battle(), "navigating to a hostile starts a battle");
+        let first_kind = state
+            .battle()
+            .and_then(|bs| {
+                bs.enemy_indices
+                    .first()
+                    .and_then(|&i| state.monsters.get(i))
+            })
+            .map(|m| m.kind);
+        assert_ne!(
+            first_kind,
+            Some(MonsterKind::Spider),
+            "test seed must avoid spider RNG in the opening enemy"
+        );
+
+        // Drive the battle to a conclusion with recorded battle actions.
+        guard = 0;
+        while state.in_battle() && guard < 300 {
+            guard += 1;
+            state.process_turn(Action::BattleMove(0), &mut visual); // Fight
+            state.process_turn(Action::BattleConfirm, &mut visual); // -> Target
+            assert_eq!(
+                state.battle().map(|b| b.phase),
+                Some(BattlePhase::Target),
+                "Fight must open target selection"
+            );
+            state.process_turn(Action::BattleConfirm, &mut visual); // resolve round
+        }
+        assert!(!state.in_battle(), "the battle must resolve");
+
+        let expected = ReplayOutcome::from_state(&state);
+        let mut replay = state.replay_data.take().unwrap();
+        replay.expected = Some(expected.clone());
+
+        let replayed = playback(&replay).expect("battle replay should reproduce");
+        assert_eq!(ReplayOutcome::from_state(&replayed), expected);
     }
 }

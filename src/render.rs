@@ -2,6 +2,7 @@ use crate::app::{
     ChallengeMode, GameMode, GameStatus, PreparationMenu, RunStats, HINT_INTERACT, HINT_INVENTORY,
     HINT_MAP, HINT_NAVIGATION,
 };
+use crate::battle::BattleState;
 use crate::campaign::{self, CampaignFlag, CampaignObjective};
 use crate::entity::{
     Camp, Item, ItemKind, Landmark, Monster, MonsterKind, Npc, NpcKind, Player, Projectile,
@@ -22,6 +23,13 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Gauge, Paragraph, Wrap};
 use ratatui::Frame;
+
+// Battle overlay renderer. Callable only when `RenderCtx` carries an optional
+// `battle` reference (added by the app/integration agent); until then the
+// runtime `if let` below falls through to the normal dungeon viewport, so the
+// HUD is untouched.
+#[path = "battle_render.rs"]
+mod battle_render;
 
 // ══════════════════════════════════════════════════════════════════════════════
 // COLOR PALETTE
@@ -129,6 +137,12 @@ pub struct RenderCtx<'a> {
     pub hints_seen: u8,
     /// Player-facing angle in radians; 0 faces east, PI/2 faces south.
     pub camera_angle: f64,
+    /// Active battle overlay state. When `Some`, `render_game` draws the
+    /// instanced battle screen into the viewport instead of the dungeon, while
+    /// the sidebar, context strip, and message log stay intact. When `None`,
+    /// the normal dungeon viewport is drawn. Matches `crate::battle::BattleState`
+    /// (phase variants Input/Target/Resolve/Victory/Defeat/Fled).
+    pub battle: Option<&'a BattleState>,
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -223,9 +237,13 @@ fn render_game(frame: &mut Frame, ctx: &RenderCtx) {
         .constraints([Constraint::Fill(1), Constraint::Length(sidebar_width)])
         .split(main_chunks[0]);
 
-    // ── Player-centered third-person dungeon, with optional full map overlay ──
-    render_dungeon_viewport(frame, game_chunks[0], ctx);
-    if ctx.show_minimap {
+    // ── Player-centered third-person dungeon, or a battle overlay ──
+    if let Some(battle) = ctx.battle {
+        battle_render::render_battle_overlay(frame, game_chunks[0], ctx, battle);
+    } else {
+        render_dungeon_viewport(frame, game_chunks[0], ctx);
+    }
+    if ctx.show_minimap && ctx.battle.is_none() {
         render_minimap(frame.buffer_mut(), game_chunks[0], ctx);
     }
 

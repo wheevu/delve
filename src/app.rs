@@ -29,12 +29,18 @@ use crate::ui::{MessageLog, MsgColor};
 use crate::visual::{
     self, PlayerActionKind, PlayerStepKind, PlayerTurnKind, VisualEffect, VisualState,
 };
+// Battle types are authored by a parallel agent in `battle.rs` and registered
+// there via `mod battle;` in main.rs. See the doc comment on the battle
+// integration methods for the exact required API.
+use crate::battle::{
+    initiative_order, BattleCommand, BattlePhase, BattleState, CombatSpeed, Combatant,
+};
 
 const MAP_WIDTH: i32 = 80;
 const MAP_HEIGHT: i32 = 50;
 const FOV_RADIUS: i32 = 8;
 const MAX_DEPTH: u32 = 4;
-pub(crate) const CURRENT_RULES_VERSION: u8 = 3;
+pub(crate) const CURRENT_RULES_VERSION: u8 = 4;
 const TICK_MS: u64 = 33;
 pub(crate) const HINT_INTERACT: u8 = 1;
 pub(crate) const HINT_NAVIGATION: u8 = 1 << 1;
@@ -160,6 +166,7 @@ macro_rules! draw {
                 preparation_menu: $self.state.preparation_menu,
                 hints_seen: $self.hints_seen,
                 camera_angle: $self.camera_angle,
+                battle: $self.state.battle(),
             };
             render::render(f, &ctx);
         })?
@@ -376,6 +383,9 @@ pub struct GameState {
     pub(crate) rules_version: u8,
     /// Campaign state (active only in Campaign mode).
     pub(crate) campaign: Option<CampaignState>,
+    /// Active instanced group battle (rules_version >= 4). While `Some`, the
+    /// world simulation is frozen and battle input drives the turn loop.
+    pub(crate) battle: Option<BattleState>,
 }
 
 /// Choose a fixed fire direction (one of 8) toward the target.
@@ -452,6 +462,7 @@ impl GameState {
             challenge_mode: ChallengeMode::Standard,
             rules_version: CURRENT_RULES_VERSION,
             campaign: None,
+            battle: None,
         }
     }
 
@@ -496,6 +507,7 @@ impl GameState {
         self.seen_monsters.clear();
         self.defeated_monsters.clear();
         self.preparation_menu = None;
+        self.battle = None;
         // Start replay recording
         self.replay_data = Some(crate::replay::ReplayData::with_modes(
             self.seed,
@@ -1500,7 +1512,10 @@ impl GameState {
             | Action::TogglePickup
             | Action::SaveGame
             | Action::LoadGame
-            | Action::Quit => crate::floor::NoiseKind::Quiet,
+            | Action::Quit
+            | Action::BattleMove(_)
+            | Action::BattleConfirm
+            | Action::BattleCancel => crate::floor::NoiseKind::Quiet,
             Action::Move(_, _)
             | Action::Dodge(_, _)
             | Action::AutoExplore
@@ -1601,6 +1616,24 @@ impl GameState {
     // ── Turn processing ──
     pub fn process_turn(&mut self, action: Action, visual: &mut VisualState) {
         if self.status != GameStatus::Playing {
+            return;
+        }
+        // While an instanced battle is active the world stays frozen. Battle
+        // input is routed through the same deterministic action log: battle
+        // actions are recorded and dispatched to the `battle_*` methods so a
+        // replay that reaches a battle reproduces it turn-for-turn.
+        if self.battle.is_some() {
+            match action {
+                Action::BattleMove(delta) => self.battle_move_cursor(delta),
+                Action::BattleConfirm => self.battle_confirm(visual),
+                Action::BattleCancel => self.battle_cancel(),
+                // Any non-battle key is ignored and not recorded while a battle
+                // is instanced, so the overworld stays frozen (no turn passes).
+                _ => return,
+            }
+            if let Some(ref mut replay) = self.replay_data {
+                replay.record(self.stats.turns, action);
+            }
             return;
         }
         self.pending_noise = Some(Self::action_noise(action));
@@ -1834,6 +1867,12 @@ impl GameState {
             .iter()
             .position(|m| m.alive && m.x == nx && m.y == ny)
         {
+            // On the latest rules version, bumping a hostile enters an
+            // instanced group battle instead of a single direct strike.
+            if self.rules_version >= 4 {
+                self.start_battle(idx, visual);
+                return;
+            }
             self.pending_noise = Some(crate::floor::NoiseKind::Impact);
             let attack_cost = match self.player.weapon {
                 Some(ItemKind::Warhammer) => 3,
@@ -3273,6 +3312,949 @@ impl GameState {
         self.msg(xp_msg, MsgColor::LOOT);
     }
 
+    // ── Instanced group battle (rules_version >= 4) ──
+    //
+    // Battles are "Pokémon-style": bumping a hostile gathers nearby awake
+    // enemies into a self-contained turn loop. While a battle is active the
+    // world simulation (end_turn / monster AI / noise / floor memory) stays
+    // frozen; `process_turn` and `end_turn` early-return so nothing advances.
+    //
+    // This integration depends on `crate::battle` (authored by a parallel
+    // agent) exposing exactly:
+    //
+    //   pub struct BattleState {
+    //       pub enemy_indices: Vec<usize>,
+    //       pub selected_target: usize,
+    //       pub command_cursor: usize,
+    //       pub phase: BattlePhase,
+    //       pub round: u32,
+    //       pub message: String,
+    //   }
+    //   pub enum BattlePhase { Input, Target /*, Resolve/Victory/Defeat/Fled */ }
+    //   pub enum BattleCommand { Fight, Technique, Item, Guard, Flee }
+    //
+    // `BattleCommand` variants are treated as unit variants (no payload).
+    // `selected_target` is an index into `enemy_indices`.
+
+    /// Whether an instanced battle is currently active.
+    #[cfg(test)]
+    pub fn in_battle(&self) -> bool {
+        self.battle.is_some()
+    }
+
+    /// Read-only access to the active battle state, for rendering/UI.
+    pub fn battle(&self) -> Option<&BattleState> {
+        self.battle.as_ref()
+    }
+
+    /// The consumable kinds offered in the battle item menu. Equipment, quest
+    /// items, and the Crown are excluded; exploration-only consumables are still
+    /// listed (and rejected with a clear message) rather than silently faked.
+    fn is_battle_usable(kind: ItemKind) -> bool {
+        matches!(
+            kind,
+            ItemKind::HealthPotion
+                | ItemKind::LargeHealthPotion
+                | ItemKind::Antidote
+                | ItemKind::ScrollOfFire
+                | ItemKind::ScrollOfConfusion
+                | ItemKind::ScrollOfBlink
+                | ItemKind::LanternOil
+                | ItemKind::SmokeBomb
+                | ItemKind::EnchantmentScroll
+                | ItemKind::LoreFragment
+        )
+    }
+
+    /// Begin an instanced battle around `bumped_idx`, gathering awake enemies
+    /// within Chebyshev distance 2. Candidates are sorted nearest-first by
+    /// Chebyshev distance, then by world index, and capped at four. The bumped
+    /// monster is always included as the nearest participant.
+    fn start_battle(&mut self, bumped_idx: usize, _visual: &mut VisualState) {
+        let Some(bumped) = self.monsters.get(bumped_idx) else {
+            return;
+        };
+        if !bumped.alive {
+            return;
+        }
+        let (bx, by) = (bumped.x, bumped.y);
+        // Collect the bump target (distance 0) plus any awake, living monster
+        // within Chebyshev distance 2, tagged with its distance for sorting.
+        let mut candidates: Vec<(u32, usize)> = Vec::new();
+        for (i, m) in self.monsters.iter().enumerate() {
+            if i == bumped_idx {
+                candidates.push((0, i));
+                continue;
+            }
+            if !m.alive || !m.awakened {
+                continue;
+            }
+            let cheb = (m.x - bx).abs().max((m.y - by).abs());
+            if cheb <= 2 {
+                candidates.push((cheb as u32, i));
+            }
+        }
+        // Nearest first, then lowest world index as a stable tie-break.
+        candidates.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+        let enemies: Vec<usize> = candidates.into_iter().map(|(_, i)| i).take(4).collect();
+
+        // Mark all participants as alert/awake and aware of the player.
+        for &i in &enemies {
+            if let Some(m) = self.monsters.get_mut(i) {
+                m.awakened = true;
+                m.alert_turns = m.alert_turns.max(3);
+                m.last_seen_player_x = self.player.x;
+                m.last_seen_player_y = self.player.y;
+            }
+        }
+        let mut bs = BattleState::new(enemies);
+        bs.message = "A battle begins! Choose a command.".to_string();
+        self.battle = Some(bs);
+        self.pending_noise = None;
+        self.msg("You are drawn into battle!", MsgColor::SYSTEM);
+    }
+
+    /// Index (into `enemy_indices`) of the first still-alive enemy.
+    fn first_alive_target(&self) -> Option<usize> {
+        let bs = self.battle.as_ref()?;
+        bs.enemy_indices
+            .iter()
+            .position(|&i| self.monsters.get(i).map(|m| m.alive).unwrap_or(false))
+    }
+
+    /// Move the battle cursor. In `Input` it scrolls commands; in `Target` it
+    /// scrolls the alive-enemy selection; in `Item` it scrolls the usable-item
+    /// list.
+    pub fn battle_move_cursor(&mut self, delta: isize) {
+        let Some(bs) = self.battle.as_mut() else {
+            return;
+        };
+        if bs.phase == BattlePhase::Input {
+            let n = 5;
+            bs.command_cursor =
+                ((bs.command_cursor as isize + delta).rem_euclid(n as isize)) as usize;
+        } else if bs.phase == BattlePhase::Target {
+            let alive: Vec<usize> = bs
+                .enemy_indices
+                .iter()
+                .copied()
+                .filter(|&i| self.monsters.get(i).map(|m| m.alive).unwrap_or(false))
+                .collect();
+            if alive.is_empty() {
+                return;
+            }
+            let cur = alive
+                .iter()
+                .position(|&i| i == bs.enemy_indices[bs.selected_target])
+                .unwrap_or(0);
+            let next = ((cur as isize + delta).rem_euclid(alive.len() as isize)) as usize;
+            bs.selected_target = bs
+                .enemy_indices
+                .iter()
+                .position(|&i| i == alive[next])
+                .unwrap_or(bs.selected_target);
+        } else if bs.phase == BattlePhase::Item {
+            if bs.item_list.is_empty() {
+                return;
+            }
+            bs.item_cursor = ((bs.item_cursor as isize + delta)
+                .rem_euclid(bs.item_list.len() as isize)) as usize;
+        }
+    }
+
+    /// Confirm the current battle selection.
+    pub fn battle_confirm(&mut self, visual: &mut VisualState) {
+        let first_target = self.first_alive_target().unwrap_or(0);
+        // Read the phase/command/item cursor without holding a mutable borrow so
+        // we can call other `&self`/`&mut self` helpers below.
+        let (phase, cmd, item_cursor) = match self.battle {
+            Some(ref bs) => (bs.phase, bs.command(), bs.item_cursor),
+            None => return,
+        };
+        match phase {
+            BattlePhase::Input => match cmd {
+                BattleCommand::Guard => {
+                    if let Some(bs) = self.battle.as_mut() {
+                        bs.message = "You brace yourself.".to_string();
+                    }
+                    self.resolve_battle_round(visual, Some((BattleCommand::Guard, None)));
+                }
+                BattleCommand::Flee => {
+                    self.battle_try_flee(visual);
+                }
+                BattleCommand::Item => {
+                    let items = self.battle_usable_items();
+                    if let Some(bs) = self.battle.as_mut() {
+                        bs.phase = BattlePhase::Item;
+                        bs.item_list = items;
+                        bs.item_cursor = 0;
+                        bs.selected_item = None;
+                        bs.message = "Choose an item.".to_string();
+                    }
+                }
+                _ => {
+                    if let Some(bs) = self.battle.as_mut() {
+                        bs.phase = BattlePhase::Target;
+                        bs.selected_target = first_target;
+                        bs.message = "Choose a target.".to_string();
+                    }
+                }
+            },
+            BattlePhase::Target => {
+                let cmd = self.battle.as_ref().map(|bs| bs.command());
+                let target = self
+                    .battle
+                    .as_ref()
+                    .and_then(|bs| bs.enemy_indices.get(bs.selected_target).copied());
+                match (cmd, target) {
+                    (Some(cmd), Some(t)) => self.resolve_battle_round(visual, Some((cmd, Some(t)))),
+                    _ => {
+                        if let Some(bs) = self.battle.as_mut() {
+                            bs.phase = BattlePhase::Input;
+                            bs.message = "No target — choose a command.".to_string();
+                        }
+                    }
+                }
+            }
+            BattlePhase::Item => {
+                let items = self.battle_usable_items();
+                let idx = item_cursor.min(items.len().saturating_sub(1));
+                let kind = match items.get(idx) {
+                    Some(&k) => k,
+                    None => {
+                        if let Some(bs) = self.battle.as_mut() {
+                            bs.phase = BattlePhase::Input;
+                            bs.message = "You have no usable item.".to_string();
+                        }
+                        return;
+                    }
+                };
+                if !self.battle_item_applicable(kind) {
+                    // Non-battle (exploration-only) effect, or not usable right
+                    // now: say so instead of silently faking an effect, and stay
+                    // in the item menu so another choice is possible.
+                    if let Some(bs) = self.battle.as_mut() {
+                        bs.message = if Self::is_exploration_only_item(kind) {
+                            format!("{} only works while exploring.", kind.name())
+                        } else {
+                            format!("You cannot use the {} now.", kind.name())
+                        };
+                    }
+                    return;
+                }
+                if let Some(bs) = self.battle.as_mut() {
+                    bs.selected_item = Some(kind);
+                }
+                self.resolve_battle_round(visual, Some((BattleCommand::Item, None)));
+            }
+            _ => {}
+        }
+    }
+
+    /// Step back from target/item selection to command selection.
+    pub fn battle_cancel(&mut self) {
+        if let Some(bs) = self.battle.as_mut() {
+            if bs.phase == BattlePhase::Target || bs.phase == BattlePhase::Item {
+                bs.phase = BattlePhase::Input;
+                bs.command_cursor = 0;
+                bs.selected_item = None;
+                bs.message = "Choose a command.".to_string();
+            }
+        }
+    }
+
+    /// Test-only wrapper for the flee command. The in-game Flee UI command
+    /// routes through `battle_try_flee` directly (see `handle_battle_key`),
+    /// so this exists purely to exercise flee behavior from unit tests.
+    #[cfg(test)]
+    pub fn battle_flee(&mut self, visual: &mut VisualState) {
+        self.battle_try_flee(visual);
+    }
+
+    /// The distinct consumable kinds the player can pick from the battle item
+    /// menu, in a stable display order. Equipment, quest items, and the Crown
+    /// are excluded; non-battle consumables still appear so the player can be
+    /// told they are exploration-only rather than silently faked.
+    fn battle_usable_items(&self) -> Vec<ItemKind> {
+        let mut kinds: Vec<ItemKind> = self
+            .player
+            .inventory
+            .iter()
+            .copied()
+            .filter(|k| Self::is_battle_usable(*k))
+            .collect();
+        kinds.sort_by_key(|k| k.name());
+        kinds.dedup();
+        kinds
+    }
+
+    /// Whether `kind` is an exploration-only effect that cannot be used inside
+    /// an instanced battle (so the menu should say so instead of faking it).
+    fn is_exploration_only_item(kind: ItemKind) -> bool {
+        matches!(
+            kind,
+            ItemKind::ScrollOfConfusion
+                | ItemKind::ScrollOfBlink
+                | ItemKind::LanternOil
+                | ItemKind::SmokeBomb
+        )
+    }
+
+    /// Whether the battle-safe effect of `kind` can actually be applied right
+    /// now (e.g. a potion only when hurt, an antidote only when poisoned).
+    fn battle_item_applicable(&self, kind: ItemKind) -> bool {
+        match kind {
+            ItemKind::HealthPotion | ItemKind::LargeHealthPotion => {
+                self.player.stats.hp < self.player.stats.max_hp
+            }
+            ItemKind::Antidote => self.player.poisoned,
+            ItemKind::ScrollOfFire => true,
+            ItemKind::EnchantmentScroll => self.player.weapon.is_some(),
+            ItemKind::LoreFragment => true,
+            _ => false,
+        }
+    }
+
+    /// Attempt to flee. Some foes refuse to be escaped, and success is
+    /// deterministic: the player breaks away iff their speed is at least the
+    /// average speed of every living participant. No RNG is involved.
+    fn battle_try_flee(&mut self, visual: &mut VisualState) {
+        // Certain foes refuse to let the player break away.
+        let denied = self
+            .battle
+            .as_ref()
+            .map(|bs| {
+                bs.enemy_indices.iter().any(|&mi| {
+                    self.monsters
+                        .get(mi)
+                        .map(|m| {
+                            m.alive
+                                && matches!(
+                                    m.kind,
+                                    MonsterKind::Guardian
+                                        | MonsterKind::BellWarden
+                                        | MonsterKind::Stalker
+                                )
+                        })
+                        .unwrap_or(false)
+                })
+            })
+            .unwrap_or(false);
+        if denied {
+            self.msg(
+                "You cannot tear yourself from this fight!",
+                MsgColor::DAMAGE_TAKEN,
+            );
+            self.resolve_battle_round(visual, None);
+            return;
+        }
+
+        // Deterministic escape: player speed >= average living participant speed.
+        let avg = {
+            let bs = self
+                .battle
+                .as_ref()
+                .expect("flee requires an active battle");
+            let enemy_speeds: Vec<u32> = bs
+                .enemy_indices
+                .iter()
+                .filter_map(|&mi| {
+                    self.monsters
+                        .get(mi)
+                        .filter(|m| m.alive)
+                        .map(|m| m.kind.speed())
+                })
+                .collect();
+            let total: u32 = self.player.speed() + enemy_speeds.iter().copied().sum::<u32>();
+            let count = enemy_speeds.len() as u32 + 1;
+            total / count
+        };
+        if self.player.speed() >= avg {
+            self.msg("You slip away from the fight.", MsgColor::SYSTEM);
+            self.battle = None;
+        } else {
+            self.msg("You fail to break away!", MsgColor::DAMAGE_TAKEN);
+            self.resolve_battle_round(visual, None);
+        }
+    }
+
+    /// Resolve one battle round in deterministic speed order. The player entry
+    /// acts first on ties so identical speeds favour the player.
+    fn resolve_battle_round(
+        &mut self,
+        visual: &mut VisualState,
+        player_action: Option<(BattleCommand, Option<usize>)>,
+    ) {
+        // Build the initiative order from real speeds: the player's computed
+        // speed versus every living enemy's kind speed. `initiative_order`
+        // sorts descending by speed and breaks ties player-first.
+        let enemies: Vec<(usize, u32)> = self
+            .battle
+            .as_ref()
+            .map(|bs| {
+                bs.enemy_indices
+                    .iter()
+                    .copied()
+                    .filter_map(|mi| {
+                        self.monsters
+                            .get(mi)
+                            .filter(|m| m.alive)
+                            .map(|m| (mi, m.kind.speed()))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let order = initiative_order(self.player.speed(), &enemies);
+
+        // Guard turns on only when the player's own initiative slot is reached,
+        // so a faster enemy still strikes before the guard comes up.
+        self.player.guarding = false;
+
+        for combatant in order {
+            if !self.player.alive {
+                break;
+            }
+            match combatant {
+                Combatant::Player => {
+                    if let Some((cmd, target)) = player_action {
+                        if cmd == BattleCommand::Guard {
+                            self.player.guarding = true;
+                        }
+                        self.apply_player_battle_action(visual, cmd, target);
+                    }
+                }
+                Combatant::Enemy(mi) => {
+                    if self.monsters.get(mi).map(|m| m.alive).unwrap_or(false) {
+                        self.battle_enemy_strike(mi, visual);
+                    }
+                }
+            }
+        }
+
+        self.player.guarding = false;
+
+        if !self.player.alive {
+            let epitaph =
+                narrative::death_epitaph(self.player.depth, self.stats.kills, None, &mut self.rng);
+            self.messages.push(epitaph, MsgColor::DAMAGE_TAKEN);
+            self.messages
+                .push("You have died...", MsgColor::DAMAGE_TAKEN);
+            self.status = GameStatus::Dead;
+            self.battle = None;
+            crate::logging::game_event(GameEvent::Death {
+                turns: self.stats.turns,
+                depth: self.player.depth,
+                killed_by: None,
+            });
+            return;
+        }
+
+        let all_dead = self
+            .battle
+            .as_ref()
+            .map(|bs| {
+                bs.enemy_indices
+                    .iter()
+                    .all(|&mi| self.monsters.get(mi).map(|m| !m.alive).unwrap_or(true))
+            })
+            .unwrap_or(true);
+        if all_dead {
+            self.msg("The battle is won!", MsgColor::KILL);
+            self.battle = None;
+            return;
+        }
+
+        let next_target = self.first_alive_target().unwrap_or(0);
+        if let Some(bs) = self.battle.as_mut() {
+            bs.round = bs.round.saturating_add(1);
+            bs.phase = BattlePhase::Input;
+            bs.command_cursor = 0;
+            bs.selected_target = next_target;
+            bs.message = "Your move.".to_string();
+        }
+    }
+
+    fn apply_player_battle_action(
+        &mut self,
+        visual: &mut VisualState,
+        cmd: BattleCommand,
+        target: Option<usize>,
+    ) {
+        match cmd {
+            BattleCommand::Fight => {
+                if let Some(t) = target {
+                    self.battle_player_strike(t, visual);
+                }
+            }
+            BattleCommand::Technique => {
+                if let Some(t) = target {
+                    self.battle_player_technique(t, visual);
+                }
+            }
+            BattleCommand::Item => {
+                if let Some(kind) = self.battle.as_ref().and_then(|b| b.selected_item) {
+                    self.battle_player_item(kind, visual);
+                }
+            }
+            BattleCommand::Guard => {
+                self.player.recover_stamina(3);
+                visual.start_player_action(PlayerActionKind::Guard);
+                self.msg("You brace for the next blow.", MsgColor::DIM);
+            }
+            BattleCommand::Flee => {
+                // Flee is normally resolved by `battle_try_flee`; nothing to do.
+            }
+        }
+    }
+
+    /// Player melee strike inside a battle, mirroring the bump-attack bonuses.
+    fn battle_player_strike(&mut self, target_idx: usize, visual: &mut VisualState) {
+        let Some(m) = self.monsters.get(target_idx) else {
+            return;
+        };
+        if !m.alive {
+            return;
+        }
+        let (mx, my) = (m.x, m.y);
+        let kind = m.kind;
+
+        let attack_cost = match self.player.weapon {
+            Some(ItemKind::Warhammer) => 3,
+            Some(ItemKind::Longsword | ItemKind::Emberbrand) => 2,
+            _ => 1,
+        };
+        let _steady = self.rules_version == 0 || self.spend_player_stamina(attack_cost);
+        let counter = self.rules_version > 0 && self.player.counter_turns > 0;
+        let interrupted = self.rules_version > 0 && self.monsters[target_idx].windup > 0;
+        if self.rules_version >= 2 {
+            self.stats.basic_attacks += 1;
+            self.stats.counters += u32::from(counter);
+            self.stats.interrupts += u32::from(interrupted);
+        }
+        if counter {
+            self.player.counter_turns = 0;
+        }
+        self.monsters[target_idx].awakened = true;
+        self.monsters[target_idx].intent = None;
+
+        let mut dmg = combat::resolve_attack(
+            self.player.total_attack(),
+            self.monsters[target_idx].stats.defense,
+        );
+        if self.player.weapon_mastery == Some(WeaponMastery::KeenEdge)
+            && self.monsters[target_idx].stats.hp * 2 > self.monsters[target_idx].stats.max_hp
+        {
+            dmg += 1;
+        }
+        if self.player.weapon == Some(ItemKind::Longsword)
+            && self.monsters[target_idx].stats.hp * 2 <= self.monsters[target_idx].stats.max_hp
+        {
+            dmg += 2;
+        }
+        if self.player.weapon == Some(ItemKind::Emberbrand)
+            && matches!(kind, MonsterKind::Spider | MonsterKind::Slime)
+        {
+            dmg += 2;
+        }
+        if counter {
+            dmg += 3 + i32::from(self.player.resolve_rank) * i32::from(self.rules_version >= 2);
+            if self.player.weapon_mastery == Some(WeaponMastery::Riposte) {
+                dmg += 2;
+            }
+        }
+        if self.player.weapon_mastery == Some(WeaponMastery::HammerBreaker)
+            && self.player.weapon == Some(ItemKind::Warhammer)
+        {
+            dmg += 1;
+        }
+        if interrupted {
+            dmg += 3;
+        }
+
+        self.monsters[target_idx].stats.hp -= dmg;
+        if interrupted {
+            self.monsters[target_idx].windup = 0;
+        }
+        self.stats.dmg_dealt += dmg;
+
+        visual.start_player_action(PlayerActionKind::Attack {
+            weapon: self.player.weapon,
+        });
+        visual.add_effect(VisualEffect::weapon_sweep(
+            mx,
+            my,
+            (mx - self.player.x).signum(),
+            (my - self.player.y).signum(),
+            self.player.weapon,
+            counter,
+        ));
+        visual.add_effect(VisualEffect::attack_flash(mx, my));
+        visual.add_effect(VisualEffect::damage_number(mx, my, dmg));
+
+        let msg_hit = narrative::hit_flavour(kind, dmg, false, &mut self.rng);
+        let killed = self.monsters[target_idx].stats.hp <= 0;
+        if !killed && dmg >= 8 {
+            self.monsters[target_idx].staggered = 1;
+        }
+        if !killed && (counter || interrupted) {
+            self.monsters[target_idx].staggered = 2;
+        }
+        self.msg(msg_hit, MsgColor::DAMAGE_DEALT);
+        if interrupted {
+            self.msg(
+                "You break the attack before it falls!",
+                MsgColor::DAMAGE_DEALT,
+            );
+        }
+        crate::logging::game_event(GameEvent::Attack {
+            attacker: "player".into(),
+            defender: kind.name().to_string(),
+            damage: dmg,
+            remaining_hp: self.monsters[target_idx].stats.hp,
+        });
+        if killed {
+            self.kill_monster(target_idx, visual);
+        }
+        self.wear_weapon(1);
+    }
+
+    /// Technique inside a battle: a battle-safe realization of the player's
+    /// equipped `TechniqueKind` (see `TechniqueKind::from_loadout`). It spends
+    /// the technique's real stamina cost, applies the technique's fixed/bonus
+    /// damage, mastery modifiers, and stagger, hits multiple targets for
+    /// multi-target techniques, and grants Cinder Arc's spider/slime bonus.
+    fn battle_player_technique(&mut self, target_idx: usize, visual: &mut VisualState) {
+        let Some(m) = self.monsters.get(target_idx) else {
+            return;
+        };
+        if !m.alive {
+            return;
+        }
+        let technique = TechniqueKind::from_loadout(&self.player);
+        if self.player.stamina < technique.cost() {
+            self.msg(
+                "You are too winded for that technique.",
+                MsgColor::DAMAGE_TAKEN,
+            );
+            return;
+        }
+        self.spend_player_stamina(technique.cost());
+        if self.rules_version >= 2 {
+            self.stats.techniques_used += 1;
+        }
+        visual.start_player_action(PlayerActionKind::Technique(technique));
+        visual.add_effect(VisualEffect::technique_cast(
+            self.player.x,
+            self.player.y,
+            1,
+            0,
+            technique,
+        ));
+
+        let targets = self.battle_technique_targets(target_idx, technique);
+        for &tgt in &targets {
+            self.battle_technique_hit(tgt, technique, visual);
+        }
+
+        if self.player.weapon.is_some() {
+            self.wear_weapon(2);
+        }
+        self.msg(
+            format!("You commit to {}.", technique.name()),
+            MsgColor::DAMAGE_DEALT,
+        );
+    }
+
+    /// The maximum number of enemies a technique strikes in battle. Mirrors the
+    /// world technique's cell count (with HammerQuake extending Earthbreak).
+    fn technique_spread(technique: TechniqueKind, player: &Player) -> u8 {
+        match technique {
+            TechniqueKind::Kick | TechniqueKind::ShieldBash => 1,
+            TechniqueKind::Lunge => 2,
+            TechniqueKind::Sweep => 3,
+            TechniqueKind::Earthbreak => {
+                if player.weapon_mastery == Some(WeaponMastery::HammerQuake) {
+                    3
+                } else {
+                    2
+                }
+            }
+            TechniqueKind::CinderArc => 4,
+        }
+    }
+
+    /// Resolve the battle targets for a technique: the selected enemy plus as
+    /// many additional living participants as the technique's spread allows.
+    fn battle_technique_targets(&self, primary: usize, technique: TechniqueKind) -> Vec<usize> {
+        let mut targets = vec![primary];
+        let spread = Self::technique_spread(technique, &self.player);
+        if spread <= 1 {
+            return targets;
+        }
+        if let Some(bs) = &self.battle {
+            for &mi in &bs.enemy_indices {
+                if mi == primary {
+                    continue;
+                }
+                if self.monsters.get(mi).map(|m| m.alive).unwrap_or(false) {
+                    targets.push(mi);
+                    if targets.len() >= spread as usize {
+                        break;
+                    }
+                }
+            }
+        }
+        targets
+    }
+
+    /// Apply one technique strike to a single enemy, mirroring the world
+    /// `hit_with_technique` resolution (fixed/bonus damage, mastery modifiers,
+    /// stagger, Cinder Arc spider/slime bonus, windup interrupt).
+    fn battle_technique_hit(
+        &mut self,
+        tgt: usize,
+        technique: TechniqueKind,
+        visual: &mut VisualState,
+    ) {
+        let Some(monster) = self.monsters.get(tgt) else {
+            return;
+        };
+        if !monster.alive {
+            return;
+        }
+        let mkind = monster.kind;
+        let (bonus, mut stagger, fixed_damage): (i32, u8, Option<i32>) = match technique {
+            TechniqueKind::Kick => (0, 1, Some(1)),
+            TechniqueKind::ShieldBash => (0, 3, None),
+            TechniqueKind::Lunge => (1, 1, None),
+            TechniqueKind::Sweep => (0, 1, None),
+            TechniqueKind::Earthbreak => (2, 2, None),
+            TechniqueKind::CinderArc => (
+                2 + i32::from(self.player.weapon_mastery == Some(WeaponMastery::EmberKindle)) * 2,
+                1,
+                None,
+            ),
+        };
+        if self.player.weapon_mastery == Some(WeaponMastery::HammerBreaker)
+            && self.player.weapon == Some(ItemKind::Warhammer)
+        {
+            stagger = stagger.saturating_add(1);
+        }
+        let mut damage = fixed_damage.unwrap_or_else(|| {
+            combat::resolve_attack(self.player.total_attack(), self.monsters[tgt].stats.defense)
+                + bonus
+        });
+        if technique == TechniqueKind::CinderArc
+            && matches!(mkind, MonsterKind::Spider | MonsterKind::Slime)
+        {
+            damage += 2;
+        }
+        let interrupted = self.monsters[tgt].windup > 0;
+        let (tx, ty) = (self.monsters[tgt].x, self.monsters[tgt].y);
+        self.monsters[tgt].awakened = true;
+        self.monsters[tgt].intent = None;
+        self.monsters[tgt].stats.hp -= damage;
+        self.monsters[tgt].staggered = self.monsters[tgt].staggered.max(stagger);
+        if interrupted {
+            self.monsters[tgt].windup = 0;
+            if self.rules_version >= 2 {
+                self.stats.interrupts += 1;
+            }
+        }
+        self.stats.dmg_dealt += damage;
+        visual.add_effect(VisualEffect::technique_impact(tx, ty, 1, 0, technique));
+        visual.add_effect(VisualEffect::attack_flash(tx, ty));
+        visual.add_effect(VisualEffect::damage_number(tx, ty, damage));
+        let flavour = narrative::hit_flavour(mkind, damage, true, &mut self.rng);
+        self.msg(flavour, MsgColor::DAMAGE_DEALT);
+        if self.monsters[tgt].stats.hp <= 0 {
+            self.kill_monster(tgt, visual);
+        }
+    }
+
+    /// Item selection inside a battle: apply the chosen consumable using its
+    /// real in-battle effect. Battle-unsafe (exploration-only) effects are never
+    /// silently faked — `battle_confirm` refuses them before this point.
+    fn battle_player_item(&mut self, kind: ItemKind, visual: &mut VisualState) {
+        let messages = &mut self.messages;
+        let mut msgs = |text: &str, color: MsgColor| messages.push(text, color);
+
+        let slot = self.player.inventory.iter().position(|&k| k == kind);
+        let Some(slot) = slot else {
+            self.msg("You have no such item.", MsgColor::DIM);
+            return;
+        };
+
+        let battle_safe = match kind {
+            ItemKind::HealthPotion | ItemKind::LargeHealthPotion => inventory::effect_potion(
+                &mut self.player,
+                &mut self.stats.items_used,
+                slot,
+                kind.heal_amount(),
+                &mut msgs,
+                visual,
+            ),
+            ItemKind::Antidote => inventory::effect_antidote(
+                &mut self.player,
+                &mut self.stats.items_used,
+                slot,
+                &mut msgs,
+                visual,
+            ),
+            ItemKind::ScrollOfFire => self.battle_fire_scroll(visual),
+            ItemKind::EnchantmentScroll => inventory::effect_enchantment(
+                &mut self.player,
+                &mut self.stats.items_used,
+                slot,
+                &mut msgs,
+            ),
+            ItemKind::LoreFragment => inventory::effect_lore_fragment(
+                &mut self.player,
+                &mut self.stats.items_used,
+                slot,
+                &mut msgs,
+            ),
+            // Exploration-only items are rejected by `battle_item_applicable`
+            // before this point, so they never reach here.
+            _ => false,
+        };
+
+        if battle_safe {
+            visual.start_player_action(PlayerActionKind::UseItem(kind));
+            visual.add_effect(VisualEffect::item_cast(self.player.x, self.player.y, kind));
+            crate::inventory::sort_inventory(&mut self.player);
+        }
+    }
+
+    /// Battle-safe realization of the fire scroll: 8 AoE damage to every enemy
+    /// in the battle (the world version hits all *visible* monsters). Kills are
+    /// awarded the same way as the overworld scroll.
+    fn battle_fire_scroll(&mut self, visual: &mut VisualState) -> bool {
+        let enemy_indices = self
+            .battle
+            .as_ref()
+            .map(|b| b.enemy_indices.clone())
+            .unwrap_or_default();
+        if enemy_indices.is_empty() {
+            return false;
+        }
+        let before: Vec<bool> = self.monsters.iter().map(|m| m.alive).collect();
+        let mut hit = 0u32;
+        for &mi in &enemy_indices {
+            if let Some(m) = self.monsters.get_mut(mi) {
+                if m.alive {
+                    m.stats.hp -= 8;
+                    self.stats.dmg_dealt += 8;
+                    hit += 1;
+                    visual.add_effect(VisualEffect::fire_ring(m.x, m.y));
+                }
+            }
+        }
+        for (i, was_alive) in before.iter().enumerate() {
+            if *was_alive && self.monsters[i].stats.hp <= 0 {
+                self.kill_monster(i, visual);
+            }
+        }
+        self.stats.items_used += 1;
+        self.player
+            .inventory
+            .retain(|&k| k != ItemKind::ScrollOfFire);
+        crate::inventory::sort_inventory(&mut self.player);
+        self.msg(
+            format!("The scroll erupts in flame! {hit} foes burned."),
+            MsgColor::DAMAGE_DEALT,
+        );
+        true
+    }
+
+    /// Enemy strike inside a battle, mirroring `end_turn` melee resolution
+    /// (guard, special abilities, poison, death) while the world stays frozen.
+    fn battle_enemy_strike(&mut self, idx: usize, visual: &mut VisualState) {
+        let kind = match self.monsters.get(idx) {
+            Some(m) if m.alive => m.kind,
+            _ => return,
+        };
+        let (mx, my) = (self.monsters[idx].x, self.monsters[idx].y);
+        let heavy = self.monsters[idx].windup > 0;
+        if heavy {
+            self.monsters[idx].windup = 0;
+        }
+        let attack_power = monster_attack_power(&self.monsters[idx], self.rules_version);
+        let mut dmg = combat::resolve_attack(attack_power, self.player.total_defense());
+        if kind == MonsterKind::Wraith && self.player.armor == Some(ItemKind::Graveward) {
+            dmg = (dmg - 2).max(1);
+        }
+        if self.player.guarding {
+            let unguarded =
+                combat::resolve_attack(attack_power, self.player.total_defense().saturating_sub(2));
+            self.stats.damage_guarded += unguarded.saturating_sub(dmg);
+            if self.rules_version > 0 {
+                let guard_cost = ((attack_power + 2) / 3).clamp(1, 4) as u8;
+                if !Self::spend_stamina_tracked(
+                    &mut self.player,
+                    &mut self.stats,
+                    self.rules_version,
+                    guard_cost,
+                ) {
+                    self.player.counter_turns = 0;
+                    dmg += 2;
+                    if self.rules_version >= 2 {
+                        self.stats.guard_breaks += 1;
+                    }
+                    visual.start_player_action(PlayerActionKind::Hit);
+                    self.messages.push(
+                        "Your guard breaks under the impact!",
+                        MsgColor::DAMAGE_TAKEN,
+                    );
+                } else {
+                    self.player.counter_turns = 2;
+                }
+            }
+        }
+        self.player.stats.hp -= dmg;
+        self.stats.dmg_taken += dmg;
+        // Unified defeat flow: the player's death is recorded immediately so the
+        // round loop stops any later combatants and the death is resolved once.
+        if self.player.stats.hp <= 0 {
+            self.player.stats.hp = 0;
+            self.player.alive = false;
+        }
+        visual.trigger_damage_flash();
+        let attack_msg = narrative::monster_hit_flavour(kind, dmg, &mut self.rng);
+        crate::logging::game_event(GameEvent::Attack {
+            attacker: kind.name().to_string(),
+            defender: "player".into(),
+            damage: dmg,
+            remaining_hp: self.player.stats.hp,
+        });
+        visual.add_effect(VisualEffect::monster_attack_flash(mx, my));
+        visual.add_effect(VisualEffect::player_damage_number(
+            self.player.x,
+            self.player.y,
+            dmg,
+        ));
+        let spider_poison = kind == MonsterKind::Spider
+            && !self.player.poisoned
+            && self.player.ward_turns <= 0
+            && self.rng.gen_bool(0.4);
+        if spider_poison {
+            self.player.poisoned = true;
+            self.player.poison_ticks = 5;
+            visual.add_effect(VisualEffect::poison_pulse(self.player.x, self.player.y));
+        }
+        self.messages.push(attack_msg, MsgColor::DAMAGE_TAKEN);
+        if spider_poison {
+            self.messages
+                .push("You are poisoned!", MsgColor::DAMAGE_TAKEN);
+        }
+        if let Some(special_msg) =
+            monster_ai::apply_special_ability(&self.monsters[idx], &mut self.player, &mut self.rng)
+        {
+            self.messages.push(special_msg, MsgColor::DAMAGE_TAKEN);
+        }
+        let _ = heavy;
+    }
+
     fn award_xp(&mut self, amount: u32) -> u8 {
         self.player.xp = self.player.xp.saturating_add(amount);
         if self.rules_version < 2 {
@@ -3699,6 +4681,10 @@ impl GameState {
     pub fn end_turn(&mut self, visual: &mut VisualState) {
         // Never process turn logic when the game is over.
         if self.status != GameStatus::Playing {
+            return;
+        }
+        // The world does not advance while an instanced battle is active.
+        if self.battle.is_some() {
             return;
         }
 
@@ -5861,6 +6847,15 @@ impl App {
             }
             return;
         }
+        // While an instanced battle is active, route keys to the battle menu
+        // and keep the world frozen. Non-battle keys (help, function toggles)
+        // fall through to their normal handlers.
+        if self.state.battle.is_some()
+            && self.state.rules_version >= 4
+            && self.handle_battle_key(code)
+        {
+            return;
+        }
         if code == KeyCode::Char('?') {
             self.show_help = true;
             return;
@@ -6089,6 +7084,50 @@ impl App {
                     self.orient_to_open_tile();
                 }
             }
+        }
+    }
+
+    /// Route a key while an instanced battle is active. Returns `true` when
+    /// the key was consumed by the battle UI (so normal play handling is
+    /// skipped). Returns `false` to let help/function toggles pass through.
+    ///
+    /// Battle inputs are translated into `Action`s and run through
+    /// `GameState::process_turn`, the same deterministic path that records and
+    /// replays every action, so a battle can be reproduced exactly.
+    fn handle_battle_key(&mut self, code: KeyCode) -> bool {
+        use KeyCode::*;
+        match code {
+            // Cursor movement (also works with arrow keys).
+            Char('k') | Char('w') | Up => {
+                self.state
+                    .process_turn(Action::BattleMove(-1), &mut self.visual);
+                true
+            }
+            Char('j') | Char('s') | Down => {
+                self.state
+                    .process_turn(Action::BattleMove(1), &mut self.visual);
+                true
+            }
+            // Confirm selection.
+            Enter | Char(' ') | Char('f') => {
+                self.state
+                    .process_turn(Action::BattleConfirm, &mut self.visual);
+                true
+            }
+            // Back out of target / item selection.
+            Esc | Char('q') | Char('c') => {
+                self.state
+                    .process_turn(Action::BattleCancel, &mut self.visual);
+                true
+            }
+            // Saving is forbidden mid-battle: the world is frozen, so F5 must
+            // not reach the normal save handler. Consume it with a clear notice.
+            F(5) => {
+                self.state
+                    .msg("You cannot save during a battle.", MsgColor::DIM);
+                true
+            }
+            _ => false,
         }
     }
 
