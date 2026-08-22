@@ -483,9 +483,7 @@ mod tests {
     #[test]
     fn surface_and_prop_metadata_do_not_override_authoritative_tiles() {
         let mut map = Map::new(4, 4);
-        for tile in &mut map.tiles {
-            *tile = Tile::Floor;
-        }
+        map.tiles.fill(Tile::Floor);
         map.set_surface(1, 1, SurfaceKind::Mud);
         map.props.push(EnvironmentProp::new(2, 2, PropKind::Gate));
 
