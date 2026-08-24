@@ -5134,9 +5134,7 @@ fn rotate_45_cw_cycles_all_8_directions() {
 #[test]
 fn necromancer_projectile_spawn_emits_directional_launch_art() {
     let mut state = state_with_floor(20, 20);
-    for visible in &mut state.map.visible {
-        *visible = true;
-    }
+    state.map.visible.fill(true);
     state.monsters.push(Monster::new(
         state.player.x + 4,
         state.player.y,
@@ -5974,9 +5972,7 @@ mod player_turn_tests {
     fn relentless_mobile_monster_advances_every_turn() {
         let (mut state, mut visual) = make_game_context();
         state.challenge_mode = crate::app::ChallengeMode::Relentless;
-        for visible in &mut state.map.visible {
-            *visible = true;
-        }
+        state.map.visible.fill(true);
         state.monsters.push(crate::entity::Monster::new(
             4,
             3,
@@ -6188,9 +6184,7 @@ mod player_turn_tests {
         let (mut state, mut visual) = make_game_context();
         state.new_game();
         state.map = Map::new(7, 7);
-        for tile in &mut state.map.tiles {
-            *tile = Tile::Floor;
-        }
+        state.map.tiles.fill(Tile::Floor);
         state.monsters.clear();
         state.items.clear();
         state.npcs.clear();
